@@ -24,6 +24,7 @@ from app.config import (
     APP_NAME,
     DEFAULT_SOURCE_LANG,
     DEFAULT_TARGET_LANG,
+    OUTPUT_DIR,
     AppConfig,
     ConfigError,
     ensure_runtime_dirs,
@@ -32,6 +33,7 @@ from app.config import (
 )
 from app.core import subtitle_io
 from app.core import checkpoint as checkpoint_store
+from app.core import queue as queue_store
 from app.core.subtitle_io import Cue, SubtitleFormatError
 from app.core.translator import (
     ENGINES,
@@ -40,6 +42,7 @@ from app.core.translator import (
     locate_untranslated,
 )
 from app.ui.model_selector import MAX_FETCH_TIMEOUT, ModelSelector
+from app.ui.queue_panel import QueuePanel
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.translate_worker import TranslateWorker
 
@@ -71,6 +74,12 @@ class MainWindow(QMainWindow):
         #: 这一跑是不是「重试未翻译」；是的话还要记住这轮的目标条数
         self._retry_mode = False
         self._retry_count = 0
+        #: 批量队列：一次排入多份字幕，依次翻完并自动导出
+        self._output_dir = Path(OUTPUT_DIR)
+        self._queue = queue_store.TranslationQueue(self._output_dir)
+        #: 当前这一跑是不是队列。是的话：收尾后接着跑下一项，且**不弹模态窗** ——
+        #: 队列是人不在场时用的，一个弹窗就能把整条队列卡死在第一个文件上。
+        self._queue_mode = False
 
         # 配置文件缺失不算错误（退回默认值），但 JSON 非法要明确告诉用户。
         self._config_error = ""
@@ -148,6 +157,13 @@ class MainWindow(QMainWindow):
         self.export_button.clicked.connect(self._on_export)
         self.export_button.setEnabled(False)
 
+        # 队列放在编辑器下面：单文件那套用法（打开 → 翻译 → 导出）是主流程，
+        # 队列是「一次处理一批」的另一条路，不该挤在主流程中间。
+        self.queue_panel = QueuePanel(self._queue)
+        self.queue_panel.add_requested.connect(self._on_queue_add)
+        self.queue_panel.start_requested.connect(self._on_queue_start)
+        self.queue_panel.queue_changed.connect(self._on_queue_changed)
+
         control_row = QHBoxLayout()
         control_row.addWidget(QLabel("源语言"))
         control_row.addWidget(self.source_combo)
@@ -184,6 +200,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(model_row)
         layout.addWidget(self.config_label)
         layout.addWidget(self.editor, 1)
+        layout.addWidget(self.queue_panel)
         layout.addWidget(self.progress)
 
         # 连接放在最后：引擎一变化就要去改 model_selector，得先保证它已经建好。
@@ -289,6 +306,24 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "解析失败", str(exc))
             return
 
+        plan = self._load_cues(path, cues)
+
+        # 上次翻到一半的记录要主动说出来：用户不知道有断点，就会以为只能重来。
+        if plan.count:
+            self.statusBar().showMessage(
+                f"已载入 {len(cues)} 条字幕　|　上次翻到 {plan.count} 条，"
+                "点「继续翻译」接着往下走"
+            )
+        else:
+            self.statusBar().showMessage(f"已载入 {len(cues)} 条字幕")
+
+    def _load_cues(
+        self, path: str | Path, cues: List[Cue]
+    ) -> checkpoint_store.ResumePlan:
+        """把一份字幕装进界面。打开单个文件、队列轮到某一项，走的都是这里。
+
+        返回它的断点计划：调用方需要知道「能复用几条」才能决定要不要续传。
+        """
         self._cues = cues
         self._source_path = Path(path)
         self.path_label.setText(f"{path}    （{len(cues)} 条）")
@@ -301,16 +336,9 @@ class MainWindow(QMainWindow):
         self._recompute_stuck()
         self._sync_retry_button()
 
-        # 上次翻到一半的记录要主动说出来：用户不知道有断点，就会以为只能重来。
         plan = self._resume_plan()
         self._sync_translate_button()
-        if plan.count:
-            self.statusBar().showMessage(
-                f"已载入 {len(cues)} 条字幕　|　上次翻到 {plan.count} 条，"
-                "点「继续翻译」接着往下走"
-            )
-        else:
-            self.statusBar().showMessage(f"已载入 {len(cues)} 条字幕")
+        return plan
 
     # ---------- 断点续传 ----------
 
@@ -423,7 +451,9 @@ class MainWindow(QMainWindow):
         平时不该占着位置 —— 一个长期灰着的按钮只会让人猜它什么时候能用。
         """
         count = len(self._stuck_indices)
-        show = count > 0 and self._worker is None
+        # 队列跑的时候一律收起来：那时「未翻译」是按文件记的（在队列列表里显示），
+        # 按钮上再报一个总数只会让人不知道它指的是哪一份。
+        show = count > 0 and self._worker is None and not self._queue_mode
         self.retry_button.setVisible(show)
         self.retry_button.setEnabled(show)
         self.retry_button.setText(f"重试未翻译（{count}）")
@@ -457,7 +487,7 @@ class MainWindow(QMainWindow):
 
         # 刻意**不清空**这几条的旧“译文”：它其实等于原文，留着正好当兜底 ——
         # 重试中途取消的话，字幕里还有原文可看，而不是变成一片空白。
-        self._start_translation(
+        reason = self._start_translation(
             self.engine_combo.currentText().strip(),
             self.source_combo.currentText().strip(),
             self.target_combo.currentText().strip(),
@@ -466,6 +496,8 @@ class MainWindow(QMainWindow):
             cues=targets,
             retry=True,
         )
+        if reason:
+            QMessageBox.critical(self, "翻译失败", reason)
 
     def _ask_retry_stuck(self, count: int, *, retried: bool = False) -> bool:
         """问要不要现在就重试这几条；返回 True 表示用户选了重试。
@@ -511,8 +543,13 @@ class MainWindow(QMainWindow):
         note: str = "",
         cues: Sequence[Cue] | None = None,
         retry: bool = False,
-    ) -> None:
+    ) -> str:
         """构造引擎与后台线程并启动。断点相关的前置判断已经在外面做完了。
+
+        返回**空串表示已启动**；非空是启动失败的原因（同时也写进了状态栏）。
+        错误不在这里弹窗，是因为队列模式下一次要跑几十个文件：一路弹模态框会把
+        整条队列卡死在第一个文件上，而队列本来就是给「人不在场」用的。
+        弹不弹由调用方决定 —— 它才知道这次是单文件还是队列。
 
         ``note`` 是启动时顺带要告诉用户的一句话（比如「上次的记录用不上」）。
         它必须由这里一起写进状态栏 —— 在外面先写会被下面的「翻译中…」覆盖掉。
@@ -529,17 +566,18 @@ class MainWindow(QMainWindow):
         if requires_api:
             self._config.translation.model = self.model_selector.current_model()
 
-        # 引擎构造留在主线程：它只读配置、不发网络请求，出错时能同步弹窗。
+        # 引擎构造留在主线程：它只读配置、不发网络请求，出错时能同步报出来。
         try:
             engine = create_engine_for(engine_name, self._config)
         except (TranslationError, ConfigError) as exc:
-            QMessageBox.critical(self, "翻译失败", str(exc))
-            self.statusBar().showMessage("翻译失败")
-            return
+            reason = str(exc)
         except Exception as exc:  # 第三方后端可能抛出任意异常，不能让它掀掉界面
-            QMessageBox.critical(self, "翻译失败", f"{type(exc).__name__}: {exc}")
-            self.statusBar().showMessage("翻译失败")
-            return
+            reason = f"{type(exc).__name__}: {exc}"
+        else:
+            reason = ""
+        if reason:
+            self.statusBar().showMessage(f"翻译失败：{reason}")
+            return reason
 
         writer = None
         if not retry and self._source_path is not None:
@@ -596,10 +634,13 @@ class MainWindow(QMainWindow):
             message = f"翻译中…（共 {total} 条）"
         self.statusBar().showMessage(f"{note}　|　{message}" if note else message)
         worker.start()
+        return ""
 
     def _on_translate(self) -> None:
         """启动翻译。**立即返回** —— 耗时的部分在后台线程里跑。"""
-        if not self._cues or self._worker is not None:
+        # 队列跑着的时候不接受单文件翻译：那时界面上的「当前文件」是队列临时摆上来的，
+        # 用户再按一次「翻译」会让两条流程同时往同一批 cues 里写。
+        if not self._cues or self._worker is not None or self._queue_mode:
             return
         engine_name = self.engine_combo.currentText().strip()
         source_lang = self.source_combo.currentText().strip()
@@ -623,13 +664,264 @@ class MainWindow(QMainWindow):
             # 不能静默失效：用户以为在接着翻，实际从头开始了，很难察觉。
             note = f"已忽略上次的翻译记录：{plan.rejected}"
 
-        self._start_translation(
+        reason = self._start_translation(
             engine_name,
             source_lang,
             target_lang,
             skip_translated=skip_translated,
             note=note,
         )
+        if reason:
+            QMessageBox.critical(self, "翻译失败", reason)
+
+    # ---------- 批量队列 ----------
+
+    def _on_queue_add(self) -> None:
+        """一次选多个文件排进队列。"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "添加字幕文件（可一次选多个）",
+            "",
+            "字幕文件 (*.srt *.vtt);;所有文件 (*)",
+        )
+        if not paths:
+            return
+        self._enqueue(paths)
+
+    def _enqueue(self, paths: Sequence[str | Path]) -> None:
+        """把文件排进队列：入队 + 试读体检 + 刷界面。
+
+        与弹对话框分开，是为了让「一次选二十个文件，其中两个坏了」这条路径
+        能被自动化测试直接走到 —— 只靠对话框进不去。
+        """
+        before = len(self._queue)
+        added, notes = self._queue.add(paths)
+        # 入队时先解析试读一遍，读不了或格式不对的当场剔掉。
+        # 队列跑起来时人不在场 —— 等轮到它才发现「这份根本读不了」就太晚了，
+        # 整条队列会停在一个用户以为没问题的文件上。
+        for item in list(added):
+            try:
+                item.cue_count = len(subtitle_io.parse_file(item.path))
+            except (SubtitleFormatError, OSError) as exc:
+                self._queue.remove(item)
+                notes.append(f"{item.path.name}：{exc}")
+
+        self.queue_panel.refresh()
+        counts = self._queue.summary()
+        message = (
+            f"已加入 {len(self._queue) - before} 个文件，队列共 {counts['total']} 个"
+        )
+        if counts["cue_count"]:
+            message += f"（{counts['cue_count']} 条字幕）"
+        if notes:
+            message += "　|　跳过 " + "；".join(self._brief(notes))
+        self.statusBar().showMessage(message)
+
+    @staticmethod
+    def _brief(notes: Sequence[str], limit: int = 3) -> List[str]:
+        """把跳过的原因压成不超过 ``limit`` 条。
+
+        一次选三十个文件全被跳过时，状态栏塞不下、也没人读得了那么长一句。
+        """
+        if len(notes) <= limit:
+            return list(notes)
+        return [*notes[:limit], f"等共 {len(notes)} 条"]
+
+    def _on_queue_changed(self) -> None:
+        """队列被增删移之后同步一句提示（面板自己已经把列表重绘过了）。"""
+        counts = self._queue.summary()
+        if not counts["total"]:
+            self.statusBar().showMessage("队列已清空")
+        else:
+            self.statusBar().showMessage(
+                f"队列共 {counts['total']} 个文件、{counts['cue_count']} 条字幕"
+            )
+
+    def _on_queue_start(self) -> None:
+        """开始（或继续）依次翻译。"""
+        if self._worker is not None or self._queue_mode or not len(self._queue):
+            return
+        counts = self._queue.summary()
+        if counts["unfinished"] == 0:
+            # 全都成功过了：再点只能是「整份重来」。这个决定必须用户明确做 ——
+            # 它会覆盖输出目录里已有的译文。
+            if not self._ask_queue_restart():
+                return
+            self._queue.reset_all()
+        else:
+            # 上一轮失败、或没轮到的（用户中途取消）可以重来；
+            # 已经翻好的不会白跑第二遍。
+            self._queue.reset_unfinished()
+        self._queue_mode = True
+        self.queue_panel.refresh()
+        self.queue_panel.set_busy(True)  # 立刻锁住，别等第一个文件启动
+        self._run_next_queue_item()
+
+    def _ask_queue_restart(self) -> bool:
+        """队列里每一份都已经成功了，再点「依次翻译」只能是想整份重来。
+
+        单独拆成一个方法是为了能在测试里替换掉 —— 真实弹窗会阻塞事件循环。
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("重新翻译全部")
+        box.setText(f"队列里 {len(self._queue)} 个文件都已经翻译过了。")
+        box.setInformativeText("重新翻译会覆盖输出目录里已有的译文。")
+        again = box.addButton("重新翻译全部", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is again
+
+    def _run_next_queue_item(self) -> None:
+        """找下一个待翻项并启动；没有了就收尾。
+
+        用循环而不是递归：一整个队列的文件都读不了时，递归会一层层压进调用栈，
+        文件多了能把栈吃满 —— 而「每个文件都在失败」恰恰最容易发生在一批本身
+        就有问题的时候。
+        """
+        while True:
+            index = self._queue.next_pending()
+            if index is None:
+                self._finish_queue()
+                return
+            if self._start_queue_item(index):
+                return
+
+    def _start_queue_item(self, index: int) -> bool:
+        """把队列第 ``index`` 项摆到界面上并开始翻译。返回是否真的启动了。"""
+        item = self._queue[index]
+        try:
+            cues = subtitle_io.parse_file(item.path)
+        except (SubtitleFormatError, OSError) as exc:
+            self._queue.fail(index, f"解析失败：{exc}")
+            self.queue_panel.refresh()
+            return False
+
+        item.cue_count = len(cues)
+        self._queue.mark_running(index)
+        # 正在翻的这一份要显示出来：用户随时能看一眼进度，也能在译文区核对。
+        plan = self._load_cues(item.path, cues)
+
+        note = f"队列 {index + 1}/{len(self._queue)}"
+        skip = False
+        if plan.count:
+            # 队列模式**不弹那个三选窗**：人不在场，弹窗会把整条队列卡死在第一个
+            # 文件上。有断点就默认接着翻 —— 这正是用户点「继续翻译」会选的那个。
+            for position, text in plan.usable.items():
+                self._cues[position].translation = text
+            skip = True
+            item.resumed = plan.count
+            note += f"　接着上次翻（已译 {plan.count} 条）"
+        elif plan.rejected:
+            note += f"　上次的记录用不上：{plan.rejected}"
+
+        reason = self._start_translation(
+            self.engine_combo.currentText().strip(),
+            self.source_combo.currentText().strip(),
+            self.target_combo.currentText().strip(),
+            skip_translated=skip,
+            note=note,
+        )
+        if reason:
+            self._queue.fail(index, reason)
+            self.queue_panel.refresh()
+            return False
+        self.queue_panel.refresh()
+        return True
+
+    def _finish_queue_item(self, outcome: str, error: str = "") -> None:
+        """一个文件跑完了：记账、导出、接着下一个。"""
+        index = self._queue.running_index
+        if index is None:
+            # 状态机不该走到这里。真走到了就干净地收尾，
+            # 别把队列永远卡在「翻译中」那个状态上。
+            self._queue_mode = False
+            self.queue_panel.refresh()
+            self._finish_queue()
+            return
+
+        item = self._queue[index]
+        if outcome == "done":
+            item.untranslated = len(self._stuck_indices)
+            try:
+                # 自动导出是队列的关键一环：无人值守时没人来点「导出…」，
+                # 不落盘就等于白跑 —— 翻完的一刻就是唯一该保存的时刻。
+                item.output_path = subtitle_io.write_file(item.output_path, self._cues)
+            except OSError as exc:
+                # 翻好了却存不下来 —— 这一份算失败：没有产物，等于白跑。
+                self._queue.fail(index, f"导出失败：{exc}")
+            else:
+                self._queue.mark_done(index)
+        else:
+            self._queue.fail(index, error)
+
+        self.queue_panel.refresh()
+        self._run_next_queue_item()
+
+    def _finish_queue(self, cancelled: bool = False, note: str = "") -> None:
+        """整条队列收尾：写状态栏，有必要时把明细摆出来。"""
+        self._queue_mode = False
+        counts = self._queue.summary()
+        total, done = counts["total"], counts["done"]
+        summary = (
+            f"队列已停止：{done}/{total} 个文件已完成"
+            if cancelled
+            else f"队列完成：{done}/{total} 个文件已翻译并保存"
+        )
+        if counts["failed"]:
+            summary += f"　|　{counts['failed']} 个失败"
+        if counts["untranslated"]:
+            summary += f"　|　共 {counts['untranslated']} 条未翻译"
+        if counts["resumed"]:
+            summary += f"　|　沿用了上次的 {counts['resumed']} 条"
+        self.statusBar().showMessage(f"{note}　|　{summary}" if note else summary)
+
+        self.queue_panel.refresh()
+        if not cancelled and (counts["failed"] or counts["untranslated"]):
+            self._report_queue()
+
+    def _report_queue(self) -> None:
+        """队列收尾的明细。
+
+        只在状态栏留一句「2 个失败」等于没说 —— 用户回来时得知道是哪两个、
+        为什么、以及接下来该点什么。单独拆成一个方法便于测试替换
+        （真实弹窗会阻塞事件循环，自动化里点不到它）。
+        """
+        failed = [item for item in self._queue if item.status == queue_store.FAILED]
+        stuck = [
+            item
+            for item in self._queue
+            if item.status == queue_store.DONE and item.untranslated
+        ]
+        lines: List[str] = []
+        if failed:
+            lines.append("以下文件没能翻完，点「继续队列」可以重试：")
+            lines.extend(
+                f"　• {item.name}：{item.one_line_error(120)}" for item in failed
+            )
+        if stuck:
+            if lines:
+                lines.append("")
+            lines.append("以下文件翻完了，但有条目没能翻译：")
+            lines.extend(
+                f"　• {item.name}：{item.untranslated} 条"
+                "（在列表里选中它，可在译文区核对）"
+                for item in stuck
+            )
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("队列结束")
+        if failed and not stuck:
+            headline = f"{len(failed)} 个文件失败"
+        elif stuck and not failed:
+            headline = f"{len(stuck)} 个文件里还有未翻译的条目"
+        else:
+            headline = "队列跑完了，但有文件需要你看一眼"
+        box.setText(headline)
+        box.setInformativeText("\n".join(lines))
+        box.addButton("知道了", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
 
     # ---------- 后台线程的回调（信号跨线程排队投递，槽仍在主线程执行） ----------
 
@@ -674,8 +966,13 @@ class MainWindow(QMainWindow):
 
         # 回抄是**静默**故障：不报告就没人会发现手里那份字幕根本没翻。
         # 救回来了在状态栏记账；没救回来的必须弹出来，并当场给一条手动重试的出路。
-        if remaining:
+        # 队列模式例外：那时人不在场，弹窗只会把队列卡在这儿，改成记在该项上、
+        # 等整条队列跑完一起报（见 _report_queue）。
+        if remaining and not self._queue_mode:
             self._warn_untranslated(remaining, retried=retry_mode)
+
+        if self._queue_mode:
+            self._finish_queue_item("done")
 
     def _on_translate_cancelled(self, done: int, total: int) -> None:
         worker = self._worker
@@ -697,6 +994,16 @@ class MainWindow(QMainWindow):
             message += "　|　已翻好的部分留在译文区"
         elif done:
             message += "　|　进度已保存，下次可从中断处继续"
+
+        if self._queue_mode:
+            # 队列里点「取消」= 停下整条队列。当前这一份打回「待翻译」，断点还在，
+            # 下次点「依次翻译」就从它接着往下走，已经翻好的文件不会白跑第二遍。
+            index = self._queue.running_index
+            if index is not None:
+                self._queue.reset(index)
+            self._finish_queue(cancelled=True, note=message)
+            return
+
         self.statusBar().showMessage(message)
         self._sync_translate_button()
 
@@ -713,6 +1020,14 @@ class MainWindow(QMainWindow):
             text += (
                 "\n\n已翻好的部分已经存下来了，处理完问题点「继续翻译」就能接着来。"
             )
+
+        if self._queue_mode:
+            # 队列里失败不回弹窗：人不在场，弹一个整条队列就再也走不下去了。
+            # 记在该项上、跳过它继续下一个（用户的明确选择），最后一起汇报。
+            self._finish_queue_item("failed", text)
+            self._sync_translate_button()
+            return
+
         QMessageBox.critical(self, "翻译失败", text)
         self.statusBar().showMessage("翻译失败")
         self._sync_translate_button()
@@ -757,8 +1072,13 @@ class MainWindow(QMainWindow):
         self.target_combo.setEnabled(not busy)
         self.model_selector.setEnabled(not busy)
         self.context_spin.setEnabled(not busy)
-        self.translate_button.setEnabled(not busy and bool(self._cues))
+        # 队列模式下「翻译」一直灰着：那时界面上的当前文件是队列摆上来的，
+        # 单文件翻译和队列同时跑会让两条流程往同一批 cues 里写。
+        self.translate_button.setEnabled(
+            not busy and not self._queue_mode and bool(self._cues)
+        )
         self.export_button.setEnabled(not busy and bool(self._cues))
+        self.queue_panel.set_busy(busy)
         self._sync_retry_button()
 
     def _on_progress(self, done: int, total: int) -> None:

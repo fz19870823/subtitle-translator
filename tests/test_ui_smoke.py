@@ -74,6 +74,9 @@ def window(qapp, monkeypatch, tmp_path):
     monkeypatch.setattr(
         checkpoint_store, "checkpoints_dir", lambda: tmp_path / "checkpoints"
     )
+    # 队列会把译文自动写盘，落点也必须指向临时目录 —— 否则测试会往仓库的
+    # output/ 里堆文件，而且「磁盘上有没有同名旧文件」会悄悄影响断言结果。
+    monkeypatch.setattr(mw, "OUTPUT_DIR", tmp_path / "output")
     win = MainWindow()
     yield win
     win.close()
@@ -209,7 +212,8 @@ def test_unknown_engine_shows_error_dialog(window, qapp, monkeypatch):
     run_translate(window, qapp)
 
     assert captured and captured[0][0] == "翻译失败"
-    assert window.statusBar().currentMessage() == "翻译失败"
+    # 原因现在一起写进状态栏：队列模式没有弹窗可看，只说一句「翻译失败」等于没说。
+    assert "翻译失败" in window.statusBar().currentMessage()
 
 
 def test_engine_combo_is_not_editable(window):
@@ -865,6 +869,282 @@ def test_manual_retry_refreshes_the_checkpoint_so_resume_keeps_it(window, qapp, 
     monkeypatch.setattr(window, "_ask_resume", lambda plan: "resume")
     run_translate(window, qapp)
     assert window._cues[0].translation == "[zh] hello", "续传不该把重试的成果退回原文"
+
+
+# ------------------------------------------------------------------ 批量队列
+
+
+def make_queue_files(tmp_path, count: int = 3, lines: int = 2) -> list:
+    """造几份**内容互不相同**的字幕。
+
+    文本必须唯一：语料重复时「这一份到底翻了没有」的比对恒为真，
+    测出来的东西和真实场景无关。
+    """
+    created = []
+    for number in range(1, count + 1):
+        blocks = [
+            f"{n}\n00:00:0{n},000 --> 00:00:0{n + 1},000\nfile{number}-line{n}"
+            for n in range(1, lines + 1)
+        ]
+        path = tmp_path / "src" / f"{number:02d}.srt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+        created.append(path)
+    return created
+
+
+def wait_queue_idle(win, qapp, timeout_ms: int = 25000) -> None:
+    """等**整条**队列跑完。
+
+    比等单个 worker 多一层：队列是在前一个文件收尾的回调里启动下一个的，
+    所以「worker 变成 None」只代表当前这一份跑完了，队列可能还在继续。
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if win._worker is None and not win._queue_mode:
+            return
+        qapp.processEvents()
+        time.sleep(0.005)
+    raise AssertionError("队列没有在超时内跑完")
+
+
+def start_queue(window, qapp, monkeypatch, delay: float = 0.02) -> tuple:
+    """跑完整条队列，返回 ``(每次创建的引擎, 汇总汇报次数)``。
+
+    汇报必须替换掉：真实弹窗会阻塞事件循环，自动化里没人去点它。
+    """
+    reported: list = []
+    monkeypatch.setattr(window, "_report_queue", lambda: reported.append(True))
+    created = install_engine(window, monkeypatch, delay=delay)
+    window.engine_combo.setCurrentText("openai")
+    window._on_queue_start()
+    wait_queue_idle(window, qapp)
+    return created, reported
+
+
+def test_queue_panel_stays_out_of_the_way_until_you_add_files(window):
+    panel = window.queue_panel
+    assert panel.list.isHidden() is True
+    assert panel.start_button.isHidden() is True
+    assert panel.add_button.isEnabled() is True, "空队列也得能添加文件"
+
+
+def test_enqueue_reads_the_files_and_drops_the_unreadable_one(window, tmp_path):
+    """坏文件当场剔掉并说明原因。
+
+    队列跑起来时人不在场 —— 等轮到它才发现「这份根本读不了」，
+    整条队列就停在一个用户以为没问题的文件上。
+    """
+    good = make_queue_files(tmp_path, 1, lines=2)[0]
+    broken = tmp_path / "src" / "broken.srt"
+    broken.write_text("这不是字幕", encoding="utf-8")
+
+    window._enqueue([good, broken])
+
+    assert [item.name for item in window._queue] == ["01.srt"]
+    assert window._queue[0].cue_count == 2, "条数在入队时就该读出来给用户看"
+    message = window.statusBar().currentMessage()
+    assert "已加入 1 个文件" in message
+    assert "跳过" in message and "broken.srt" in message
+
+
+def test_queue_translates_every_file_and_saves_the_output(
+    window, qapp, monkeypatch, tmp_path
+):
+    """队列的核心承诺：逐个翻完，各自落盘。
+
+    自动导出是无人值守的关键一环 —— 人不在场，没人来点「导出…」，
+    不落盘就等于白跑。
+    """
+    window._enqueue(make_queue_files(tmp_path, 3))
+    start_queue(window, qapp, monkeypatch)
+
+    counts = window._queue.summary()
+    assert counts["done"] == 3 and counts["failed"] == 0
+    for item in window._queue:
+        assert item.output_path.exists(), f"{item.name} 的译文没落盘"
+        assert "[slow]" in item.output_path.read_text(encoding="utf-8")
+    assert "队列完成：3/3" in window.statusBar().currentMessage()
+    assert window.editor.toPlainText(), "编辑器里该留着最后处理的那一份"
+
+
+def test_queue_skips_a_failing_file_and_keeps_going(
+    window, qapp, monkeypatch, tmp_path
+):
+    """一份失败不该拖住整条队列 —— 这正是「跳过失败继续下一个」的意义。"""
+    window._enqueue(make_queue_files(tmp_path, 3))
+
+    class Picky(SlowEngine):
+        """碰到指定文本就报错，模拟「这一份怎么都翻不动」。"""
+
+        def __init__(self, poison) -> None:
+            super().__init__(delay=0.01)
+            self._poison = set(poison)
+
+        def translate_batch(self, requests):
+            if any(request.text in self._poison for request in requests):
+                raise TranslationError("HTTP 502（已自动重试 3 次）")
+            return super().translate_batch(requests)
+
+    reported: list = []
+    monkeypatch.setattr(window, "_report_queue", lambda: reported.append(True))
+    monkeypatch.setattr(
+        mw, "create_engine_for", lambda name, cfg=None: Picky({"file2-line1"})
+    )
+    one_line_per_request(window)
+    window.engine_combo.setCurrentText("openai")
+    window._on_queue_start()
+    wait_queue_idle(window, qapp)
+
+    assert [item.status for item in window._queue] == ["done", "failed", "done"]
+    assert window._queue[1].error, "失败要留下原因，否则用户不知道该查什么"
+    assert window._queue[2].output_path.exists(), "前面失败不该拦住后面"
+    assert "队列完成：2/3" in window.statusBar().currentMessage()
+    assert reported == [True], "有失败就得把明细摆出来，只在状态栏留一句话等于没说"
+
+
+def test_cancelling_stops_the_whole_queue(window, qapp, monkeypatch, tmp_path):
+    """取消 = 停下整条队列。当前这一份打回「待翻译」，下次从它接着走。"""
+    window._enqueue(make_queue_files(tmp_path, 3, lines=4))
+    monkeypatch.setattr(window, "_report_queue", lambda: None)
+    install_engine(window, monkeypatch, delay=0.2)
+    window.engine_combo.setCurrentText("openai")
+
+    window._on_queue_start()
+    wait_for_progress(window, qapp, 1)
+    window._on_cancel()
+    assert window._worker.wait(15000)
+    wait_queue_idle(window, qapp)
+
+    assert window._queue_mode is False
+    assert window._queue[0].status == "pending", "中断的那一份要能接着跑"
+    assert [item.status for item in window._queue[1:]] == ["pending", "pending"]
+    assert "队列已停止" in window.statusBar().currentMessage()
+    # 一份成品都没有，按钮上说「依次翻译」才是实话；被中断的那一份带着断点，
+    # 重新跑起来会从断点续上（见 test_queue_resumes_without_asking_the_three_way_question）。
+    assert window.queue_panel.start_button.text() == "依次翻译（3）"
+
+
+def test_queue_resumes_without_asking_the_three_way_question(
+    window, qapp, monkeypatch, tmp_path
+):
+    """队列里不弹那个三选窗。
+
+    队列是人不在场时用的：一个模态框就能把整条队列永久卡死在第一个文件上。
+    有断点就默认接着翻 —— 这正是用户点「继续翻译」时会选的那一个。
+    """
+    window._enqueue(make_queue_files(tmp_path, 2, lines=4))
+    monkeypatch.setattr(window, "_report_queue", lambda: None)
+    install_engine(window, monkeypatch, delay=0.2)
+    window.engine_combo.setCurrentText("openai")
+
+    window._on_queue_start()
+    wait_for_progress(window, qapp, 1)
+    window._on_cancel()
+    assert window._worker.wait(15000)
+    wait_queue_idle(window, qapp)
+    assert window._queue[0].status == "pending"
+
+    def boom(plan):
+        raise AssertionError("队列模式不该弹三选窗")
+
+    monkeypatch.setattr(window, "_ask_resume", boom)
+    install_engine(window, monkeypatch, delay=0.01)
+    window._on_queue_start()
+    wait_queue_idle(window, qapp)
+
+    assert window._queue[0].status == "done"
+    assert window._queue[0].resumed > 0, "续传了多少条要说出来"
+
+
+def test_queue_asks_before_redoing_files_that_already_succeeded(
+    window, qapp, monkeypatch, tmp_path
+):
+    """全都成功过了再点「依次翻译」，只能是「整份重来」—— 这个决定得用户做。"""
+    window._enqueue(make_queue_files(tmp_path, 2))
+    start_queue(window, qapp, monkeypatch)
+    assert window._queue.summary()["done"] == 2
+
+    asked: list = []
+    monkeypatch.setattr(
+        window, "_ask_queue_restart", lambda: asked.append(True) or False
+    )
+    window._on_queue_start()
+
+    assert asked == [True], "必须先问"
+    assert window._queue_mode is False, "用户没确认就不该开跑"
+    assert [item.status for item in window._queue] == ["done", "done"]
+
+    # 确认之后才整份重来
+    monkeypatch.setattr(window, "_ask_queue_restart", lambda: True)
+    monkeypatch.setattr(window, "_report_queue", lambda: None)
+    install_engine(window, monkeypatch, delay=0.01)
+    window._on_queue_start()
+    wait_queue_idle(window, qapp)
+    assert window._queue.summary()["done"] == 2
+
+
+def test_queue_controls_are_locked_while_the_queue_runs(
+    window, qapp, monkeypatch, tmp_path
+):
+    """跑队列时不能改队列：中途增删移会让「正在翻第几项」对不上号。"""
+    window._enqueue(make_queue_files(tmp_path, 2, lines=4))
+    monkeypatch.setattr(window, "_report_queue", lambda: None)
+    install_engine(window, monkeypatch, delay=0.2)
+    window.engine_combo.setCurrentText("openai")
+
+    window._on_queue_start()
+    qapp.processEvents()
+    panel = window.queue_panel
+    assert panel.add_button.isEnabled() is False
+    assert panel.remove_button.isEnabled() is False
+    assert panel.clear_button.isEnabled() is False
+    assert panel.start_button.isEnabled() is False
+    assert window.translate_button.isEnabled() is False, "队列跑着时不该能单文件翻译"
+
+    window._on_cancel()
+    assert window._worker.wait(15000)
+    wait_queue_idle(window, qapp)
+    assert panel.add_button.isEnabled() is True
+
+
+def test_queue_uses_the_ui_context_window(window, qapp, monkeypatch, tmp_path):
+    """队列也要听界面上那个「上下文窗口」，否则一次跑十几个文件时会悄悄用旧值。"""
+    window._enqueue(make_queue_files(tmp_path, 1, lines=4))
+    recorder = BatchRecorder()
+    monkeypatch.setattr(mw, "create_engine_for", lambda name, cfg=None: recorder)
+    monkeypatch.setattr(window, "_report_queue", lambda: None)
+    window.engine_combo.setCurrentText("openai")
+    window.context_spin.setValue(3)
+
+    window._on_queue_start()
+    wait_queue_idle(window, qapp)
+
+    assert recorder.sizes == [3, 1]
+
+
+def test_queue_remove_move_and_clear_buttons(window, tmp_path):
+    window._enqueue(make_queue_files(tmp_path, 3))
+    panel = window.queue_panel
+
+    panel.list.setCurrentRow(2)
+    panel.up_button.click()
+    assert [item.name for item in window._queue] == ["01.srt", "03.srt", "02.srt"]
+
+    panel.list.setCurrentRow(1)
+    panel.remove_button.click()
+    assert [item.name for item in window._queue] == ["01.srt", "02.srt"]
+
+    panel.clear_button.click()
+    assert len(window._queue) == 0
+    assert panel.list.isHidden() is True
+    assert "队列已清空" in window.statusBar().currentMessage()
+
+
+def test_queue_summary_reports_the_cue_count(window, tmp_path):
+    window._enqueue(make_queue_files(tmp_path, 3, lines=2))
+    assert window._queue.summary()["cue_count"] == 6
+    assert "6 条字幕" in window.statusBar().currentMessage()
 
 
 # ------------------------------------------------------------------ 设置保存
