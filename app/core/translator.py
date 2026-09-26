@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import abc
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Sequence, Type
 
@@ -17,6 +18,71 @@ if TYPE_CHECKING:  # 只为类型标注，运行时不引入，避免循环依�
 
 class TranslationError(RuntimeError):
     """后端无法完成本次请求。"""
+
+
+#: 任意语言的字母（拉丁、西里尔、希腊、假名、汉字、谚文…）。
+#: 换行记号 ⏎、数字、各类标点都不属于字母 —— 这正是我们想要的：
+#: 「123」「---」「♪♪」这种行不该参与回抄判定。
+_LETTER_RE = re.compile(
+    r"[^\W\d_]", re.UNICODE
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def is_translatable(text: str) -> bool:
+    """这条文本是否含需要翻译的实义字符。
+
+    纯粹的符号行、数字行、空行在跨语言翻译里本就该原样保留，
+    拿它们去判断「模型是不是没翻译」会得出错误的结论。
+    """
+    if not text or not text.strip():
+        return False
+    return bool(_LETTER_RE.search(_TAG_RE.sub(" ", text)))
+
+
+def _norm_lang(code: str) -> str:
+    return (code or "").strip().lower().replace("_", "-")
+
+
+def should_check_echo(source_lang: str, target_lang: str) -> bool:
+    """是否对该批次做「原样回抄」检查。
+
+    只在能确定**是两门不同语言**时才检查，判不准就宁可漏检：
+
+    - 语言码为空或是 ``auto``：无从判断，误报会打断正常任务；
+    - 只是地区/字形变体（``en-GB`` 对 ``en-US``、``zh-CN`` 对 ``zh-TW``）：
+      这类转换里大量条目本来就该原样，回抄比例天然偏高，判定必然误报。
+    """
+    src, dst = _norm_lang(source_lang), _norm_lang(target_lang)
+    if not src or not dst or "auto" in (src, dst):
+        return False
+    return src.split("-")[0] != dst.split("-")[0]
+
+
+def looks_like_verbatim_echo(
+    sources: Sequence[str],
+    outputs: Sequence[str],
+    source_lang: str,
+    target_lang: str,
+    *,
+    min_items: int = 3,
+    threshold: float = 0.5,
+) -> bool:
+    """译文是否整批与原文一模一样。
+
+    真实故障形态：中继把请求路由到能力不足的上游时，会把整个数组**原样返回**，
+    不是零散几条 —— 所以按「批次」判定，命中率高、误报少。
+    单条相同是正常的（专有名词、缩写），因此只在可比条目够多时判定，
+    且要求超过半数。
+    """
+    if not should_check_echo(source_lang, target_lang):
+        return False
+
+    pairs = [(s, o) for s, o in zip(sources, outputs) if is_translatable(s)]
+    if len(pairs) < min_items:
+        return False
+    echoed = sum(1 for s, o in pairs if s.strip() == o.strip())
+    return echoed / len(pairs) > threshold
 
 
 @dataclass

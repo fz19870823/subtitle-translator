@@ -11,7 +11,10 @@ from app.core.translator import (
     Translator,
     create_engine,
     create_engine_for,
+    is_translatable,
+    looks_like_verbatim_echo,
     register,
+    should_check_echo,
 )
 
 SAMPLE = """1
@@ -112,3 +115,64 @@ def test_register_rejects_missing_or_base_name():
 def test_create_engine_for_without_config_uses_no_arg_constructor():
     engine = create_engine_for("echo", None)
     assert isinstance(engine, EchoTranslator)
+
+
+# ------------------------------------------------------------ 整批原样回抄检测
+#
+# 背景：实测某些中继会间歇性把整个数组原样返回（12 次请求里中 2 次，两个方向都中）。
+# 这是最危险的失败形态 —— 用户拿到一份没翻译的字幕却看不出来。
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("hello", True),
+        ("こんにちは", True),
+        ("你好", True),
+        ("안녕하세요", True),
+        ("Привет", True),
+        ("", False),
+        ("   ", False),
+        ("123", False),
+        ("---", False),
+        ("♪♪", False),
+        ("\u23ce", False),
+        ("<i></i>", False),
+        ("<i>hi</i>", True),  # 剥掉标签后还剩字母
+        ("你好\u23ce再见", True),
+    ],
+)
+def test_is_translatable(text, expected):
+    assert is_translatable(text) is expected
+
+
+def test_should_check_echo_skips_same_or_unknown_language():
+    assert should_check_echo("en", "zh-CN") is True
+    assert should_check_echo("ja", "ko") is True
+    assert should_check_echo("auto", "zh-CN") is False
+    assert should_check_echo("ja", "ja") is False
+    assert should_check_echo("zh-CN", "zh-CN") is False
+    # 判不了就问不出结论：宁可不查，也别把正常任务判成失败
+    assert should_check_echo("", "ja") is False
+    # 同一门语言的地区/字形变体：大量条目本就该原样，回抄比例天然偏高
+    assert should_check_echo("en-GB", "en-US") is False
+    assert should_check_echo("zh-CN", "zh-TW") is False
+
+
+def test_echo_detection_requires_min_items_and_majority():
+    src = ["hello", "world", "good"]
+    assert looks_like_verbatim_echo(src, list(src), "en", "zh-CN") is True
+    # 只有 1/3 回抄，属于正常现象（专有名词等），不判故障
+    assert looks_like_verbatim_echo(src, ["你好", "world", "好的"], "en", "zh-CN") is False
+    # 可比条目不足 3 条时不判定
+    assert looks_like_verbatim_echo(["a", "b"], ["a", "b"], "en", "zh-CN") is False
+    # 源语言=目标语言，本就不该翻译
+    assert looks_like_verbatim_echo(src, list(src), "en", "en") is False
+
+
+def test_echo_detection_ignores_untranslatable_lines():
+    # 符号行、数字行原样保留是正常的，不能算进"回抄"
+    src = ["123", "---", "♪♪", "OK!", "hello"]
+    out = ["123", "---", "♪♪", "OK!", "hello"]
+    # 可比条目只有 "OK!" "hello" 两条，达不到 min_items=3
+    assert looks_like_verbatim_echo(src, out, "en", "zh-CN") is False

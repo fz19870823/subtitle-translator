@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 from app.config import TranslationConfig
-from app.core.translator import TranslationError, TranslationRequest, Translator, register
+from app.core.translator import (
+    TranslationError,
+    TranslationRequest,
+    Translator,
+    looks_like_verbatim_echo,
+    register,
+)
 
 # 从模型回复里抠出 JSON 数组：优先整段解析，失败再退回首个 [...] 片段。
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
@@ -116,6 +122,11 @@ class OpenAICompatTranslator(Translator):
     #: 需要 base_url / 密钥 / 模型这些外部参数，界面据此决定是否启用模型选择。
     requires_api = True
 
+    #: 检测到整批原样回抄时的额外重试次数（共尝试 echo_retries + 1 次）。
+    #: 实测某些中继会把请求路由到能力不足的上游，把整个数组原样吐回来，
+    #: 且是间歇性的 —— 不重试就会静默交付一份没翻译的字幕。
+    echo_retries = 2
+
     def __init__(
         self,
         *,
@@ -127,6 +138,7 @@ class OpenAICompatTranslator(Translator):
         style_hint: str = "",
         batch_size: int = 20,
         preserve_line_breaks: bool = True,
+        echo_retries: int | None = None,
     ) -> None:
         if not base_url:
             raise TranslationError("base_url 未配置")
@@ -145,9 +157,13 @@ class OpenAICompatTranslator(Translator):
         self.style_hint = style_hint
         self.batch_size = int(batch_size)
         self.preserve_line_breaks = bool(preserve_line_breaks)
+        if echo_retries is not None:
+            self.echo_retries = max(0, int(echo_retries))
         self._api_key = api_key  # 私有：不参与 repr，也不写进日志
         #: 因模型丢换行而被单独重译的条目数，便于观测提示词是否退化
         self.line_repair_count = 0
+        #: 因整批原样回抄而重发的批次数
+        self.echo_retry_count = 0
 
     # 防止密钥经由 repr/日志外泄
     def __repr__(self) -> str:
@@ -214,10 +230,18 @@ class OpenAICompatTranslator(Translator):
         return fetch_models(self.base_url, self._api_key, timeout=min(self.timeout, 60))
 
     # ------------------------------------------------------------------ 翻译
-    def _system_prompt(self, target_lang: str) -> str:
-        prompt = _SYSTEM_PROMPT.format(target=target_lang or "中文", mark=_LINE_MARK)
+    def _system_prompt(self, target_lang: str, *, strict: bool = False) -> str:
+        target = target_lang or "中文"
+        prompt = _SYSTEM_PROMPT.format(target=target, mark=_LINE_MARK)
         if self.style_hint:
             prompt += f"\n6. 额外要求：{self.style_hint}"
+        if strict:
+            # 上一次整批被原样退回，再问一次时把要求说死，别让对方继续偷懒。
+            prompt += (
+                "\n\n【重试】上一次回答把原文原样返回了，等于没有翻译。"
+                f"这次请逐条改写成{target}，"
+                "不得原样返回原文，也不得只改标点、空格或语序了事。"
+            )
         return prompt
 
     def _encode(self, text: str) -> str:
@@ -304,24 +328,23 @@ class OpenAICompatTranslator(Translator):
             return results
 
         texts = [self._encode(t) for _, t in todo]
-        user_content = json.dumps(texts, ensure_ascii=False)
-        if source_lang and source_lang != "auto":
-            user_content = f"源语言: {source_lang}\n{user_content}"
 
-        content = self._chat(
-            [
-                {"role": "system", "content": self._system_prompt(target_lang)},
-                {"role": "user", "content": user_content},
-            ],
-            max_tokens=min(8192, 256 + 120 * len(texts)),
-        )
-
-        parsed = self._parse_array(content, len(texts))
-        if parsed is None:
-            # 批量协议被破坏（模型加了解释/数量不符）时退回逐条，宁可慢也不丢内容。
-            parsed = []
-            for text in texts:
-                parsed.append(self._translate_one(text, source_lang, target_lang))
+        parsed: List[str] = []
+        for attempt in range(self.echo_retries + 1):
+            parsed = self._request_batch(
+                texts, source_lang, target_lang, strict=attempt > 0
+            )
+            if not looks_like_verbatim_echo(texts, parsed, source_lang, target_lang):
+                break
+            if attempt < self.echo_retries:
+                self.echo_retry_count += 1
+        else:
+            raise TranslationError(
+                f"连续 {self.echo_retries + 1} 次拿到的译文与原文完全相同，"
+                f"{source_lang} -> {target_lang} 未真正执行翻译。"
+                "这通常是上游把请求路由到了不支持跨语言翻译的通道，"
+                "稍后重试或换一个模型即可。"
+            )
 
         for (index, original), translation in zip(todo, parsed):
             fixed = self._decode(translation)
@@ -333,6 +356,36 @@ class OpenAICompatTranslator(Translator):
                     fixed = repaired
             results[index] = fixed
         return results
+
+    def _request_batch(
+        self,
+        texts: Sequence[str],
+        source_lang: str,
+        target_lang: str,
+        *,
+        strict: bool = False,
+    ) -> List[str]:
+        """发一次批量请求并解析；批量协议被破坏时退回逐条。"""
+        user_content = json.dumps(list(texts), ensure_ascii=False)
+        if source_lang and source_lang != "auto":
+            user_content = f"源语言: {source_lang}\n{user_content}"
+
+        content = self._chat(
+            [
+                {
+                    "role": "system",
+                    "content": self._system_prompt(target_lang, strict=strict),
+                },
+                {"role": "user", "content": user_content},
+            ],
+            max_tokens=min(8192, 256 + 120 * len(texts)),
+        )
+
+        parsed = self._parse_array(content, len(texts))
+        if parsed is None:
+            # 批量协议被破坏（模型加了解释/数量不符）时退回逐条，宁可慢也不丢内容。
+            parsed = [self._translate_one(t, source_lang, target_lang) for t in texts]
+        return parsed
 
     def _translate_lines(
         self, text: str, source_lang: str, target_lang: str

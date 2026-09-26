@@ -364,3 +364,136 @@ def test_requires_api_flag_distinguishes_engines():
     assert Translator.requires_api is False
     assert EchoTranslator.requires_api is False
     assert OpenAICompatTranslator.requires_api is True
+
+
+# ------------------------------------------------------------------ 整批回抄重试
+#
+# 实测背景：中继会间歇性把整个数组原样返回（12 次请求里中 2 次，中→日和日→中
+# 都出现过），而且不是零散几条 —— 是整批。这种失败对用户最危险：
+# 拿到一份根本没翻译的字幕，界面上却看不出任何异常。
+
+
+def bulk() -> list[TranslationRequest]:
+    return [req(t) for t in ("hello", "world", "good morning")]
+
+
+def test_whole_batch_echo_is_retried_with_a_sterner_prompt(monkeypatch):
+    engine = make_engine()
+    src = ["hello", "world", "good morning"]
+    replies = [
+        json.dumps(src, ensure_ascii=False),                       # 第一次：原样吐回
+        json.dumps(["你好", "世界", "早上好"], ensure_ascii=False),   # 重试：正常
+    ]
+    prompts: list[str] = []
+
+    def fake_chat(messages, *, max_tokens=4096):
+        prompts.append(messages[0]["content"])
+        return replies.pop(0)
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    out = engine.translate_batch(bulk())
+
+    assert out == ["你好", "世界", "早上好"]
+    assert engine.echo_retry_count == 1
+    assert len(prompts) == 2
+    assert "重试" not in prompts[0]
+    assert "重试" in prompts[1], "重试的那次要把要求说死"
+
+
+def test_exhausted_echo_retries_raise_instead_of_shipping_garbage(monkeypatch):
+    engine = make_engine(echo_retries=1)
+    src = ["hello", "world", "good morning"]
+
+    def fake_chat(messages, *, max_tokens=4096):
+        return json.dumps(src, ensure_ascii=False)  # 一直回抄
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    with pytest.raises(TranslationError) as info:
+        engine.translate_batch(bulk())
+
+    assert "完全相同" in str(info.value)
+    assert engine.echo_retry_count == 1, "echo_retries=1 表示只重发一次"
+
+
+def test_echo_retries_zero_means_single_attempt(monkeypatch):
+    engine = make_engine(echo_retries=0)
+    src = ["hello", "world", "good morning"]
+    calls: list[int] = []
+
+    def fake_chat(messages, *, max_tokens=4096):
+        calls.append(1)
+        return json.dumps(src, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    with pytest.raises(TranslationError):
+        engine.translate_batch(bulk())
+    assert len(calls) == 1
+    assert engine.echo_retry_count == 0
+
+
+def test_minority_echo_is_accepted_without_retry(monkeypatch):
+    engine = make_engine()
+    calls: list[int] = []
+
+    def fake_chat(messages, *, max_tokens=4096):
+        calls.append(1)
+        # 3 条里 1 条与原相同（专有名词式），不过半，不该重试
+        return json.dumps(["你好", "world", "早上好"], ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    out = engine.translate_batch(bulk())
+
+    assert out == ["你好", "world", "早上好"]
+    assert len(calls) == 1
+    assert engine.echo_retry_count == 0
+
+
+def test_auto_source_skips_echo_detection(monkeypatch):
+    # auto 判不出源语言，「回抄」也可能本来就该原样保留，不该打扰用户
+    engine = make_engine()
+    src = ["hello", "world", "good morning"]
+
+    def fake_chat(messages, *, max_tokens=4096):
+        return json.dumps(src, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    reqs = [
+        TranslationRequest(text=t, source_lang="auto", target_lang="zh-CN")
+        for t in src
+    ]
+    assert engine.translate_batch(reqs) == src
+    assert engine.echo_retry_count == 0
+
+
+def test_same_language_pair_skips_echo_detection(monkeypatch):
+    engine = make_engine()
+    src = ["hello", "world", "good morning"]
+
+    def fake_chat(messages, *, max_tokens=4096):
+        return json.dumps(src, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    reqs = [
+        TranslationRequest(text=t, source_lang="en-GB", target_lang="en-US")
+        for t in src
+    ]
+    assert engine.translate_batch(reqs) == src
+    assert engine.echo_retry_count == 0
+
+
+def test_echo_retry_also_catches_echo_from_the_per_item_fallback(monkeypatch):
+    """协议坏掉走逐条回退时，逐条也回抄 —— 同样要被抓到。"""
+    engine = make_engine(echo_retries=0)
+    src = ["hello", "world", "good morning"]
+    calls: list[int] = []
+
+    def fake_chat(messages, *, max_tokens=4096):
+        calls.append(1)
+        if len(calls) == 1:
+            return "抱歉，我无法完成"      # 批量协议失败
+        return json.dumps([src[len(calls) - 2]])  # 逐条也只回抄
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    with pytest.raises(TranslationError, match="完全相同"):
+        engine.translate_batch(bulk())
+    assert len(calls) == 4, "1 次批量失败 + 3 次逐条"
