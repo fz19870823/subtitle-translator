@@ -7,6 +7,7 @@ from app.core.subtitle_io import parse_srt
 from app.core.translator import (
     ENGINES,
     EchoTranslator,
+    TranslationCancelled,
     TranslationError,
     Translator,
     create_engine,
@@ -67,6 +68,55 @@ def test_batch_size_must_be_positive():
         EchoTranslator().translate_cues(
             parse_srt(SAMPLE), source_lang="en", target_lang="zh-CN", batch_size=-3
         )
+
+
+def test_should_stop_aborts_between_batches():
+    """取消在批与批之间生效：不再发新请求，已经翻好的部分要留着。
+
+    上千条字幕要发几十次请求、跑好几分钟，用户点取消后不该干等下去。
+    """
+    cues = parse_srt(SAMPLE)
+    batches: list[int] = []
+
+    class Counting(Translator):
+        name = "counting"
+
+        def translate_batch(self, requests):
+            batches.append(len(requests))
+            return [f"[zh-CN] {r.text}" for r in requests]
+
+    asked: list[int] = []
+
+    def should_stop() -> bool:
+        asked.append(1)
+        return len(asked) > 1  # 第一批放行，第二批之前喊停
+
+    with pytest.raises(TranslationCancelled):
+        Counting().translate_cues(
+            cues,
+            source_lang="en",
+            target_lang="zh-CN",
+            batch_size=1,
+            should_stop=should_stop,
+        )
+
+    assert batches == [1], "第二批请求不该再发出去"
+    assert cues[0].translation == "[zh-CN] hello", "已翻好的部分必须留下"
+    assert cues[1].translation == "", "没轮到的条目保持未翻译"
+
+
+def test_should_stop_before_first_batch_translates_nothing():
+    cues = parse_srt(SAMPLE)
+    with pytest.raises(TranslationCancelled):
+        EchoTranslator().translate_cues(
+            cues, source_lang="en", target_lang="zh-CN", should_stop=lambda: True
+        )
+    assert [cue.translation for cue in cues] == ["", ""]
+
+
+def test_cancelled_is_not_a_translation_error():
+    """取消不是故障：界面靠这个区分「取消」和「翻译失败」两种收尾。"""
+    assert not issubclass(TranslationCancelled, TranslationError)
 
 
 def test_batch_size_none_uses_engine_default():

@@ -34,6 +34,10 @@ from app.core.subtitle_io import Cue, SubtitleFormatError
 from app.core.translator import ENGINES, TranslationError, create_engine_for
 from app.ui.model_selector import MAX_FETCH_TIMEOUT, ModelSelector
 from app.ui.settings_dialog import SettingsDialog
+from app.ui.translate_worker import TranslateWorker
+
+#: 关窗时最多等后台翻译线程多久收尾（毫秒）。超过就放弃等待，避免窗口卡住。
+CLOSE_WAIT_MS = 8000
 
 
 class MainWindow(QMainWindow):
@@ -42,6 +46,10 @@ class MainWindow(QMainWindow):
         ensure_runtime_dirs()
         self._cues: List[Cue] = []
         self._source_path: Path | None = None
+        #: 正在跑的后台翻译线程；None 表示当前空闲
+        self._worker: TranslateWorker | None = None
+        #: 本次翻译的 (引擎名, 源语言, 目标语言)，成功后写进状态栏
+        self._translation_meta: Tuple[str, str, str] = ("", "", "")
 
         # 配置文件缺失不算错误（退回默认值），但 JSON 非法要明确告诉用户。
         self._config_error = ""
@@ -90,6 +98,12 @@ class MainWindow(QMainWindow):
         self.translate_button.clicked.connect(self._on_translate)
         self.translate_button.setEnabled(False)
 
+        # 翻译是分钟级的（上千条字幕要发几十次请求），必须给用户一条退路。
+        self.cancel_button = QPushButton("取消")
+        self.cancel_button.clicked.connect(self._on_cancel)
+        self.cancel_button.setToolTip("中止翻译（当前这批请求返回后停止）")
+        self.cancel_button.setVisible(False)
+
         self.export_button = QPushButton("导出…")
         self.export_button.clicked.connect(self._on_export)
         self.export_button.setEnabled(False)
@@ -104,6 +118,7 @@ class MainWindow(QMainWindow):
         control_row.addWidget(self.settings_button)
         control_row.addStretch(1)
         control_row.addWidget(self.translate_button)
+        control_row.addWidget(self.cancel_button)
         control_row.addWidget(self.export_button)
 
         model_row = QHBoxLayout()
@@ -226,7 +241,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已载入 {len(cues)} 条字幕")
 
     def _on_translate(self) -> None:
-        if not self._cues:
+        """启动翻译。**立即返回** —— 耗时的部分在后台线程里跑。"""
+        if not self._cues or self._worker is not None:
             return
         engine_name = self.engine_combo.currentText().strip()
         source_lang = self.source_combo.currentText().strip()
@@ -237,14 +253,9 @@ class MainWindow(QMainWindow):
         if getattr(ENGINES.get(engine_name), "requires_api", False):
             self._config.translation.model = self.model_selector.current_model()
 
+        # 引擎构造留在主线程：它只读配置、不发网络请求，出错时能同步弹窗。
         try:
             engine = create_engine_for(engine_name, self._config)
-            engine.translate_cues(
-                self._cues,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                progress=self._on_progress,
-            )
         except (TranslationError, ConfigError) as exc:
             QMessageBox.critical(self, "翻译失败", str(exc))
             self.statusBar().showMessage("翻译失败")
@@ -254,8 +265,35 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("翻译失败")
             return
 
+        # 真正耗时的部分必须进后台线程：上千条字幕要发几十次请求、跑好几分钟，
+        # 放在主线程里窗口会整个冻住（进度条不动、取消都点不了）。
+        self._translation_meta = (engine_name, source_lang, target_lang)
+        worker = TranslateWorker(
+            engine,
+            self._cues,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            parent=self,
+        )
+        worker.progressed.connect(self._on_progress)
+        worker.succeeded.connect(self._on_translate_succeeded)
+        worker.cancelled.connect(self._on_translate_cancelled)
+        worker.failed.connect(self._on_translate_failed)
+        self._worker = worker  # 保留引用：线程被回收会连带丢掉信号连接
+        self._set_busy(True)
+        self.progress.setValue(0)
+        self.statusBar().showMessage(f"翻译中…（共 {len(self._cues)} 条）")
+        worker.start()
+
+    # ---------- 后台线程的回调（信号跨线程排队投递，槽仍在主线程执行） ----------
+
+    def _on_translate_succeeded(self) -> None:
+        engine = self._worker.engine if self._worker is not None else None
+        self._finish_translation()
+
         self.editor.setPlainText(subtitle_io.to_srt(self._cues))
-        notes = engine.quality_notes()
+        engine_name, source_lang, target_lang = self._translation_meta
+        notes = engine.quality_notes() if engine is not None else []
         summary = f"{engine_name} 翻译完成：{source_lang} → {target_lang}"
         if notes:
             summary += "　|　" + "；".join(notes)
@@ -263,7 +301,7 @@ class MainWindow(QMainWindow):
 
         # 回抄是**静默**故障：不报告就没人会发现手里那份字幕根本没翻。
         # 救回来了在状态栏记账；没救回来的必须弹出来。
-        if engine.untranslated_count:
+        if engine is not None and engine.untranslated_count:
             QMessageBox.warning(
                 self,
                 "部分字幕可能没有翻译",
@@ -272,8 +310,72 @@ class MainWindow(QMainWindow):
                 "请先在译文区核对这几条再导出；换成别的模型通常可以解决。",
             )
 
+    def _on_translate_cancelled(self, done: int, total: int) -> None:
+        self._finish_translation()
+        # 已翻好的部分留着：用户能核对或导出半成品，不必从头再来。
+        self.editor.setPlainText(subtitle_io.to_srt(self._cues))
+        self.statusBar().showMessage(f"已取消：{done}/{total} 条已翻译")
+
+    def _on_translate_failed(self, kind: str, message: str) -> None:
+        self._finish_translation()
+        text = message if kind == "TranslationError" else f"{kind}: {message}"
+        QMessageBox.critical(self, "翻译失败", text)
+        self.statusBar().showMessage("翻译失败")
+
+    def _on_cancel(self) -> None:
+        if self._worker is None:
+            return
+        self._worker.cancel()
+        self.cancel_button.setEnabled(False)
+        self.statusBar().showMessage("正在取消…（等当前这批请求返回）")
+
+    def _finish_translation(self) -> None:
+        """收尾：回收线程、恢复控件。成功 / 取消 / 失败三条路径都要走这里。"""
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.wait(CLOSE_WAIT_MS)  # 信号已到主线程，线程此时基本已退出
+            worker.deleteLater()  # worker 是窗口的子对象，不显式回收会随翻译次数累积
+        self._set_busy(False)
+
+    def _set_busy(self, busy: bool) -> None:
+        """翻译期间锁住会改变任务输入或结果的控件。
+
+        不锁的话用户能在翻译跑着时换字幕文件 —— 后台线程还在往旧对象里写译文，
+        界面最终显示一份与当前文件对不上的结果，而且看不出哪里错了。
+        """
+        busy = bool(busy)
+        # 取消按钮只在忙碌时出现；每次重新进入忙碌都要把它的禁用状态复位，
+        # 否则「取消」过一次之后，下一轮翻译的取消按钮点不动。
+        self.cancel_button.setVisible(busy)
+        if busy:
+            self.cancel_button.setEnabled(True)
+        self.open_button.setEnabled(not busy)
+        self.settings_button.setEnabled(not busy)
+        self.engine_combo.setEnabled(not busy)
+        self.source_combo.setEnabled(not busy)
+        self.target_combo.setEnabled(not busy)
+        self.model_selector.setEnabled(not busy)
+        self.translate_button.setEnabled(not busy and bool(self._cues))
+        self.export_button.setEnabled(not busy and bool(self._cues))
+
     def _on_progress(self, done: int, total: int) -> None:
         self.progress.setValue(0 if not total else int(done / total * 100))
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 的命名约定
+        """关窗时必须先送走后台线程。
+
+        窗口对象一旦被回收，还在跑的 QThread 会踩到野指针（Qt 会直接报
+        "Destroyed while thread is still running" 并可能崩进程）。
+        """
+        worker = self._worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            if not worker.wait(CLOSE_WAIT_MS):
+                # 当前这批 HTTP 请求还挂着（中继无响应时可等到超时）。宁可多等一会儿，
+                # 也不能让线程在运行中被销毁。
+                self.statusBar().showMessage("等待当前请求结束…")
+                worker.wait()
+        super().closeEvent(event)
 
     def _on_export(self) -> None:
         if not self._cues:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import pytest
 
@@ -61,6 +62,43 @@ def load_sample(win) -> None:
     win.export_button.setEnabled(True)
 
 
+def wait_idle(win, qapp, timeout_ms: int = 15000) -> None:
+    """等后台线程与主线程槽都收尾完毕。
+
+    翻译在后台线程跑，信号是**排队投递**的：线程结束后还得跑一轮事件循环，
+    槽函数才会执行。只 ``wait()`` 线程是不够的。
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while win._worker is not None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
+    assert win._worker is None, "翻译收尾（_finish_translation）没有执行"
+
+
+def run_translate(win, qapp, timeout_ms: int = 15000) -> None:
+    """触发翻译并等它彻底跑完（异步化后测试不能再同步断言）。"""
+    win._on_translate()
+    worker = win._worker
+    if worker is not None:
+        assert worker.wait(timeout_ms), f"翻译线程 {timeout_ms}ms 内没有结束"
+    wait_idle(win, qapp, timeout_ms)
+
+
+class SlowEngine(Translator):
+    """每批睡一会儿，用来观察「翻译进行中」的界面状态。"""
+
+    name = "openai"
+    batch_size = 1
+
+    def __init__(self, delay: float = 0.4) -> None:
+        self._delay = delay
+
+    def translate_batch(self, requests):
+        time.sleep(self._delay)
+        return ["[slow] " + r.text for r in requests]
+
+
 def test_buttons_start_disabled(window):
     assert window.translate_button.isEnabled() is False
     assert window.export_button.isEnabled() is False
@@ -82,24 +120,24 @@ def test_config_label_shows_summary_without_crashing(window):
     assert "密钥" in text
 
 
-def test_translate_fills_editor_and_progress(window):
+def test_translate_fills_editor_and_progress(window, qapp):
     load_sample(window)
-    window._on_translate()
+    run_translate(window, qapp)
     assert window.progress.value() == 100
     body = window.editor.toPlainText()
     assert "[echo] hello" in body or "[zh-CN] hello" in body
 
 
-def test_export_round_trip(window, tmp_path):
+def test_export_round_trip(window, qapp, tmp_path):
     load_sample(window)
-    window._on_translate()
+    run_translate(window, qapp)
     dst = subtitle_io.write_file(tmp_path / "out.srt", window._cues)
     reloaded = subtitle_io.parse_file(dst)
     assert len(reloaded) == 2
     assert reloaded[0].text.strip().startswith("[")
 
 
-def test_unknown_engine_shows_error_dialog(window, monkeypatch):
+def test_unknown_engine_shows_error_dialog(window, qapp, monkeypatch):
     load_sample(window)
     captured: list[tuple[str, str]] = []
 
@@ -117,7 +155,7 @@ def test_unknown_engine_shows_error_dialog(window, monkeypatch):
         raise TranslationError(f"未知的翻译引擎 {name!r}")
 
     monkeypatch.setattr(mw, "create_engine_for", boom)
-    window._on_translate()
+    run_translate(window, qapp)
 
     assert captured and captured[0][0] == "翻译失败"
     assert window.statusBar().currentMessage() == "翻译失败"
@@ -162,7 +200,7 @@ def test_engine_source_reports_configured_endpoint(window):
     assert 0 < timeout <= 60
 
 
-def test_translate_uses_model_picked_in_the_ui(window, monkeypatch):
+def test_translate_uses_model_picked_in_the_ui(window, qapp, monkeypatch):
     """界面换模型要即时生效，不能悄悄沿用配置文件里的旧值。"""
     load_sample(window)
     window.engine_combo.setCurrentText("openai")
@@ -183,10 +221,102 @@ def test_translate_uses_model_picked_in_the_ui(window, monkeypatch):
         return FakeEngine()
 
     monkeypatch.setattr(mw, "create_engine_for", fake_create)
-    window._on_translate()
+    run_translate(window, qapp)
 
     assert seen["model"] == "ui-picked-model"
     assert "[fake] hello" in window.editor.toPlainText()
+
+
+# ------------------------------------------------------ 后台翻译：不阻塞界面
+
+
+def test_translation_runs_off_the_ui_thread(window, qapp, monkeypatch):
+    """翻译必须在后台线程跑。
+
+    这正是要修的故障：以前直接在界面线程里调 ``translate_cues()``，
+    一部上千条的字幕要发几十次请求、跑好几分钟，窗口在整个过程中完全冻结 ——
+    进度条不重绘、连「取消」都点不了，用户只看到程序死了。
+    """
+    load_sample(window)
+    window.engine_combo.setCurrentText("openai")
+    monkeypatch.setattr(mw, "create_engine_for", lambda name, cfg=None: SlowEngine())
+
+    started = time.monotonic()
+    window._on_translate()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2, "点「翻译」必须立刻返回，不能等翻译跑完"
+    assert window._worker is not None and window._worker.isRunning()
+    assert window.progress.value() == 0, "还没跑完不该显示完成"
+
+    # 能处理事件 = 界面没被冻住，这是「不卡死」的直接判据
+    qapp.processEvents()
+    assert window.translate_button.isEnabled() is False, "翻译期间不该能重复点击"
+    assert window.open_button.isEnabled() is False, "翻译期间不该能换文件"
+    assert window.export_button.isEnabled() is False, "翻译期间不该能导出半成品"
+    assert window.cancel_button.isHidden() is False, "翻译期间要能看到取消按钮"
+
+    wait_idle(window, qapp)
+    assert window.progress.value() == 100
+    assert window.translate_button.isEnabled() is True
+    assert window.open_button.isEnabled() is True
+    assert window.cancel_button.isHidden() is True, "空闲时取消按钮该收起来"
+
+
+def test_cancel_stops_the_translation(window, qapp, monkeypatch):
+    """取消要真的停下：不再发新请求，并保住已翻好的部分。"""
+    load_sample(window)
+    window.engine_combo.setCurrentText("openai")
+    monkeypatch.setattr(mw, "create_engine_for", lambda name, cfg=None: SlowEngine())
+
+    window._on_translate()
+    worker = window._worker
+    assert worker is not None and worker.isRunning()
+
+    window._on_cancel()
+    assert worker.wait(10000), "取消后线程没有退出"
+    done, total = worker.done, worker.total
+    wait_idle(window, qapp)
+
+    assert "已取消" in window.statusBar().currentMessage()
+    assert window.translate_button.isEnabled() is True, "取消后要能重新开始"
+    assert done < total, "取消意味着没有全部翻完"
+
+
+def test_progress_bar_follows_the_background_worker(window, qapp, monkeypatch):
+    """进度必须随后台进度实时更新，而不是跑完才跳一下。"""
+    load_sample(window)
+    window.engine_combo.setCurrentText("openai")
+    monkeypatch.setattr(mw, "create_engine_for", lambda name, cfg=None: SlowEngine())
+
+    seen: list[int] = []
+    window._on_translate()
+    worker = window._worker
+    assert worker is not None
+    worker.progressed.connect(lambda done, total: seen.append(done))
+
+    wait_idle(window, qapp)
+    assert seen == [1, 2], "第一批处理完就应该上报一次进度"
+    assert window.progress.value() == 100
+
+
+def test_closing_while_translating_sends_the_thread_away(window, qapp, monkeypatch):
+    """翻译中途关窗不能留一个还在跑的线程。
+
+    窗口对象一被回收，运行中的 QThread 就会踩野指针，Qt 会直接报
+    "Destroyed while thread is still running" 并可能崩掉进程。
+    """
+    load_sample(window)
+    window.engine_combo.setCurrentText("openai")
+    monkeypatch.setattr(mw, "create_engine_for", lambda name, cfg=None: SlowEngine())
+
+    window._on_translate()
+    worker = window._worker
+    assert worker is not None and worker.isRunning()
+
+    window.close()
+
+    assert not worker.isRunning(), "closeEvent 必须把后台线程送走"
 
 
 # ------------------------------------------------------------------ 设置保存

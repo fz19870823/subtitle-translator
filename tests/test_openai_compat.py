@@ -486,6 +486,7 @@ def test_partially_untranslated_batch_is_counted_not_fatal(monkeypatch):
     assert out == ["你好", "世界", "早上好", "OK"]
     assert engine.echo_retry_count == 0, "只有 1/4 没翻，不到整批重发的门槛"
     assert engine.echo_item_count == 1, "应该只挑出 'OK' 这一条去重译"
+    assert engine.echo_item_attempts == 2, "逐条也要试够次数（echo_item_retries=2）"
     assert engine.echo_repaired_count == 0, "重译也没救回来"
     assert engine.untranslated_count == 1, "没救回来的必须计数"
     assert any("1 条疑似未翻译" in n for n in engine.quality_notes())
@@ -510,7 +511,10 @@ def test_auto_source_still_catches_echo_by_reading_the_text(monkeypatch):
     ]
     with pytest.raises(TranslationError, match="完全相同"):
         engine.translate_batch(reqs)
-    assert engine.echo_retry_count == 2, "auto 也要走完整的重发流程"
+    assert engine.echo_retry_count == engine.echo_retries, "auto 也要走完整的重发流程"
+    assert engine.echo_retries >= 3, (
+        "chat-fast 这种免费档单次回抄率约 1/3，重试 3 次才能把「连续全中」压到 1%"
+    )
 
 
 def test_auto_source_with_matching_language_is_left_alone(monkeypatch):
@@ -545,6 +549,36 @@ def test_same_language_pair_skips_echo_detection(monkeypatch):
     ]
     assert engine.translate_batch(reqs) == src
     assert engine.echo_retry_count == 0
+
+
+def test_per_item_rescue_retries_before_giving_up(monkeypatch):
+    """逐条救援也要试够次数：单条同样是概率性失败，只试一次会漏。
+
+    实测 chat-fast 单条请求也有约 1/3 撞上原样退回。只试一次的话，
+    「每批零星几条没翻」会一条条渗进成品 —— 一部 1000 条的字幕能累计到几十条。
+    """
+    engine = make_engine()
+    item_calls = 0
+
+    def fake_chat(messages, *, max_tokens=4096):
+        nonlocal item_calls
+        payload = user_payload(messages)
+        if len(payload) > 1:
+            return json.dumps(["你好", "world", "早上好"], ensure_ascii=False)
+        item_calls += 1
+        if item_calls == 1:
+            return json.dumps(["world"], ensure_ascii=False)  # 第一次逐条也回抄
+        return json.dumps(["世界"], ensure_ascii=False)        # 第二次才成功
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    out = engine.translate_batch(bulk())
+
+    assert out == ["你好", "世界", "早上好"]
+    assert engine.echo_retry_count == 0, "只有 1/3 没过半，不该整批重发"
+    assert engine.echo_item_count == 1, "条目去重后只有 1 条"
+    assert engine.echo_item_attempts == 2, "试了两次才救回来"
+    assert engine.echo_repaired_count == 1
+    assert engine.untranslated_count == 0
 
 
 def test_echo_retry_also_catches_echo_from_the_per_item_fallback(monkeypatch):

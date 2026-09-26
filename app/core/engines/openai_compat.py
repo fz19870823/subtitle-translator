@@ -128,11 +128,22 @@ class OpenAICompatTranslator(Translator):
     #: 检测到整批原样回抄时的额外重试次数（共尝试 echo_retries + 1 次）。
     #: 实测某些中继会把请求路由到能力不足的上游，把整个数组原样吐回来，
     #: 且是间歇性的 —— 不重试就会静默交付一份没翻译的字幕。
-    echo_retries = 2
+    #:
+    #: 取值依据（2026-09-26 判别实验）：`grok-chat-fast` 这种免费档是
+    #: **请求级**随机失败，实测单次回抄率约 1/3，且与批量大小、提示词写法、
+    #: 是否带 system 角色都无关（同一份请求体发 8 次，2 次退回原文）。
+    #: 于是「连续 N+1 次都撞上」的概率是 (1/3)^(N+1)：
+    #: N=2 时 3.7%，N=3 时 1.2% —— 加一次只多花约 2.6% 的请求，很划算。
+    echo_retries = 3
 
     #: 整批重发仍救不回来时，是否把没翻的条目拎出来逐条重译。
-    #: 单条请求更不容易被上游"整批偷懒"，实测能救回大部分残留。
+    #: 单条请求更不容易被上游“整批偷懒”，实测能救回大部分残留。
     echo_downgrade = True
+
+    #: 逐条重译时每个条目最多试几次。单条同样是约 1/3 的随机失败，
+    #: 只试一次会留下「每批零星几条」的残留（一部 1000 条的字幕累计能到几十条），
+    #: 试两次把单条残留率从 1/3 压到 1/9。只对已判定失败的条目发请求，代价极小。
+    echo_item_retries = 2
 
     def __init__(
         self,
@@ -147,6 +158,7 @@ class OpenAICompatTranslator(Translator):
         preserve_line_breaks: bool = True,
         echo_retries: int | None = None,
         echo_downgrade: bool | None = None,
+        echo_item_retries: int | None = None,
     ) -> None:
         if not base_url:
             raise TranslationError("base_url 未配置")
@@ -169,13 +181,17 @@ class OpenAICompatTranslator(Translator):
             self.echo_retries = max(0, int(echo_retries))
         if echo_downgrade is not None:
             self.echo_downgrade = bool(echo_downgrade)
+        if echo_item_retries is not None:
+            self.echo_item_retries = max(0, int(echo_item_retries))
         self._api_key = api_key  # 私有：不参与 repr，也不写进日志
         #: 因模型丢换行而被单独重译的条目数，便于观测提示词是否退化
         self.line_repair_count = 0
         #: 因整批原样回抄而重发的批次数
         self.echo_retry_count = 0
-        #: 因残留未翻译条目而触发的逐条重译条数
+        #: 因残留未翻译条目而触发的逐条重译**条目数**（去重）
         self.echo_item_count = 0
+        #: 逐条重译实际发出的**请求次数**（含对同一条目的重复尝试），用于算配额开销
+        self.echo_item_attempts = 0
         #: 逐条重译救回来的条数
         self.echo_repaired_count = 0
         #: 用尽所有手段后仍未翻译的条数（> 0 说明这批译文不完整）
@@ -373,7 +389,8 @@ class OpenAICompatTranslator(Translator):
         三级处置，代价由小到大：
 
         1. 整批被原样退回 —— 换成把要求说死的提示词整批重发（最多 ``echo_retries`` 次）；
-        2. 重发后仍有零星条目一字未改 —— 只把这几个拎出来单独重译，比其他条目贵不了多少；
+        2. 重发后仍有零星条目一字未改 —— 只把这几个拎出来单独重译
+           （每个条目最多 ``echo_item_retries`` 次），比其他条目贵不了多少；
         3. 单条重译仍纹丝不动 —— 计入 ``untranslated_count``；若整批可比条目**无一**
            翻出来，说明这条通道是真不干活，直接报错，绝不把没翻译的字幕当成品交出去。
         """
@@ -386,13 +403,22 @@ class OpenAICompatTranslator(Translator):
         leftover = locate_untranslated(texts, parsed, target_lang)
         if leftover and self.echo_downgrade:
             self.echo_item_count += len(leftover)
-            for index in leftover:
-                retried = self._translate_one(
-                    texts[index], source_lang, target_lang, strict=True
-                )
-                if retried.strip() != texts[index].strip():
-                    parsed[index] = retried
-                    self.echo_repaired_count += 1
+            pending = list(leftover)
+            for _ in range(self.echo_item_retries):
+                if not pending:
+                    break
+                still_stuck: list[int] = []
+                for index in pending:
+                    self.echo_item_attempts += 1
+                    retried = self._translate_one(
+                        texts[index], source_lang, target_lang, strict=True
+                    )
+                    if retried.strip() != texts[index].strip():
+                        parsed[index] = retried
+                        self.echo_repaired_count += 1
+                    else:
+                        still_stuck.append(index)
+                pending = still_stuck
 
         remaining = locate_untranslated(texts, parsed, target_lang)
         if remaining:

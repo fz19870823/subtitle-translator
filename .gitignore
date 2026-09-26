@@ -20,8 +20,9 @@ wheels/
 # ---- 测试与覆盖率 ----
 .pytest_cache/
 # 本机 pytest 的临时目录与隔离依赖（PySide6 与 pytest 不在同一个解释器，
-# 给 3.14 装 pytest 时用 --target 落到这里，绝不污染系统 Python）
-.pytest_tmp/
+# 给 3.14 装 pytest 时用 --target 落到这里，绝不污染系统 Python）。
+# basetemp 每次换新目录名，否则攒到 50+ 文件后清理会被沙箱 safe-delete 批量拦截。
+.pytest_tmp*/
 .pytest_deps/
 .coverage
 .coverage.*

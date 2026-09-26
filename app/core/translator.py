@@ -20,6 +20,14 @@ class TranslationError(RuntimeError):
     """后端无法完成本次请求。"""
 
 
+class TranslationCancelled(RuntimeError):
+    """用户主动中止了本次翻译。
+
+    **刻意不继承** :class:`TranslationError`：取消是用户的正常选择，不是故障。
+    若继承，界面上「翻译失败」的弹窗会把主动取消也报成错误。
+    """
+
+
 #: 任意语言的字母（拉丁、西里尔、希腊、假名、汉字、谚文…）。
 #: 换行记号 ⏎、数字、各类标点都不属于字母 —— 这正是我们想要的：
 #: 「123」「---」「♪♪」这种行不该参与回抄判定。
@@ -219,6 +227,8 @@ class TranslationRequest:
 
 
 ProgressCallback = Callable[[int, int], None]
+#: 返回 True 表示应当中止。在**批与批之间**被查询，批内无法中断。
+StopCallback = Callable[[], bool]
 
 
 class Translator(abc.ABC):
@@ -274,8 +284,15 @@ class Translator(abc.ABC):
         target_lang: str,
         batch_size: int | None = None,
         progress: ProgressCallback | None = None,
+        should_stop: StopCallback | None = None,
     ) -> Sequence[Cue]:
-        """就地写入 ``cue.translation``，返回同一序列。"""
+        """就地写入 ``cue.translation``，返回同一序列。
+
+        ``should_stop`` 是「还要不要继续」的回调，**每批之间**查一次。
+        批内没法中断 —— 一次 HTTP 请求已经在路上，只能等它返回；实测单批
+        3–5 秒，所以取消的延迟上限就是一批的时间。有了它，用户点取消后
+        不必干等几十批跑完（上千条字幕要几分钟）。
+        """
         # None = 没传（用引擎默认值）；0 或负数 = 调用方写错了，必须报错而不是静默兜底。
         size = self.batch_size if batch_size is None else batch_size
         if size <= 0:
@@ -283,6 +300,8 @@ class Translator(abc.ABC):
 
         total = len(cues)
         for offset in range(0, total, size):
+            if should_stop is not None and should_stop():
+                raise TranslationCancelled(f"已取消，完成 {offset}/{total} 条")
             window = list(cues[offset: offset + size])
             requests = [
                 TranslationRequest(
