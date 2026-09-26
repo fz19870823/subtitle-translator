@@ -1,0 +1,32 @@
+[project]
+name = "subtitle-translator"
+version = "0.1.0"
+description = "字幕翻译工具：读取 SRT / WebVTT，批量翻译后导出"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# 入口脚本在仓库根部，不在 app 包内，需要单独声明为顶层模块。
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[project.scripts]
+subtitle-translator = "main:main"
