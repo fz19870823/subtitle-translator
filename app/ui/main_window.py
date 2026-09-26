@@ -6,6 +6,7 @@ from typing import List, Tuple
 
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -26,10 +27,13 @@ from app.config import (
     ConfigError,
     ensure_runtime_dirs,
     load_config,
+    save_config,
 )
 from app.core import subtitle_io
 from app.core.subtitle_io import Cue, SubtitleFormatError
 from app.core.translator import ENGINES, TranslationError, create_engine_for
+from app.ui.model_selector import MAX_FETCH_TIMEOUT, ModelSelector
+from app.ui.settings_dialog import SettingsDialog
 
 
 class MainWindow(QMainWindow):
@@ -74,10 +78,13 @@ class MainWindow(QMainWindow):
 
         self.engine_combo = QComboBox()
         self.engine_combo.addItems(sorted(ENGINES))
-        # 默认选中配置里指定的引擎（若该引擎未注册则保持第一项）
-        configured_engine = self._config.translation.engine
-        if configured_engine in ENGINES:
-            self.engine_combo.setCurrentText(configured_engine)
+
+        self.model_selector = ModelSelector()
+        self.model_selector.set_source_provider(self._engine_source)
+        self.model_selector.set_current_model(self._config.translation.model)
+
+        self.settings_button = QPushButton("设置…")
+        self.settings_button.clicked.connect(self._on_settings)
 
         self.translate_button = QPushButton("翻译")
         self.translate_button.clicked.connect(self._on_translate)
@@ -94,9 +101,14 @@ class MainWindow(QMainWindow):
         control_row.addWidget(self.target_combo)
         control_row.addWidget(QLabel("引擎"))
         control_row.addWidget(self.engine_combo)
+        control_row.addWidget(self.settings_button)
         control_row.addStretch(1)
         control_row.addWidget(self.translate_button)
         control_row.addWidget(self.export_button)
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("模型"))
+        model_row.addWidget(self.model_selector, 1)
 
         self.editor = QPlainTextEdit()
         self.editor.setPlaceholderText("打开字幕文件后，原文与译文会显示在这里…")
@@ -111,9 +123,19 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.addLayout(file_row)
         layout.addLayout(control_row)
+        layout.addLayout(model_row)
         layout.addWidget(self.config_label)
         layout.addWidget(self.editor, 1)
         layout.addWidget(self.progress)
+
+        # 连接放在最后：引擎一变化就要去改 model_selector，得先保证它已经建好。
+        self.engine_combo.currentTextChanged.connect(self._on_engine_changed)
+        configured_engine = self._config.translation.engine
+        if configured_engine in ENGINES:
+            self.engine_combo.setCurrentText(configured_engine)
+        # 必须显式刷一次：setCurrentText 设成和当前相同的值**不会发信号**，
+        # 光靠信号会让初始状态错掉（例如配置是 echo，模型控件却是可用的）。
+        self._on_engine_changed(self.engine_combo.currentText())
 
     def _config_summary(self) -> str:
         """配置摘要。只报告密钥来源，绝不显示密钥内容。"""
@@ -133,6 +155,52 @@ class MainWindow(QMainWindow):
         combo.addItems(values)
         combo.setCurrentText(current)
         return combo
+
+    # ---------- 连接参数 ----------
+
+    def _engine_source(self) -> Tuple[str, str, int]:
+        """给模型选择器用的 (base_url, api_key, timeout)。"""
+        t = self._config.translation
+        try:
+            key = t.resolve_api_key()
+        except ConfigError:
+            key = ""
+        return t.base_url, key, min(int(t.timeout or 30), MAX_FETCH_TIMEOUT)
+
+    def _refresh_config_label(self) -> None:
+        self.config_label.setText(self._config_summary())
+
+    def _on_engine_changed(self, engine_name: str) -> None:
+        """按引擎能力决定模型控件是否可用（echo 用不到地址和模型）。"""
+        engine = ENGINES.get(engine_name)
+        self.model_selector.set_active(bool(getattr(engine, "requires_api", False)))
+        self._refresh_config_label()
+
+    def _on_settings(self) -> None:
+        engine_name = self.engine_combo.currentText().strip()
+        dialog = SettingsDialog(
+            self._config,
+            requires_api=bool(getattr(ENGINES.get(engine_name), "requires_api", False)),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        updated = dialog.result_config()
+        # 引擎是主界面上的选择，对话框不管它
+        updated.translation.engine = engine_name
+        try:
+            saved = save_config(updated)
+        except OSError as exc:
+            QMessageBox.critical(self, "保存配置失败", str(exc))
+            return
+
+        updated.source = saved
+        self._config = updated
+        self._config_error = ""
+        self.model_selector.set_current_model(self._config.translation.model)
+        self._refresh_config_label()
+        self.statusBar().showMessage(f"配置已保存：{saved}")
 
     # ---------- 交互 ----------
 
@@ -163,6 +231,11 @@ class MainWindow(QMainWindow):
         engine_name = self.engine_combo.currentText().strip()
         source_lang = self.source_combo.currentText().strip()
         target_lang = self.target_combo.currentText().strip()
+
+        # 界面上临时选的模型要即时生效，否则会悄悄沿用配置文件里的旧值。
+        # 想持久化就走「设置…」。
+        if getattr(ENGINES.get(engine_name), "requires_api", False):
+            self._config.translation.model = self.model_selector.current_model()
 
         try:
             engine = create_engine_for(engine_name, self._config)

@@ -39,10 +39,82 @@ _SYSTEM_PROMPT = (
 )
 
 
+def explain_http_error(detail: str) -> str:
+    """把服务端的错误体压成一行可读信息，便于定位。"""
+    try:
+        err = json.loads(detail).get("error")
+    except (json.JSONDecodeError, AttributeError):
+        return detail.strip() or "(无响应体)"
+    if isinstance(err, dict):
+        code = err.get("code") or err.get("type") or "?"
+        return f"[{code}] {err.get('message', '')}".strip()
+    return str(err) if err else detail.strip()
+
+
+def extract_model_ids(payload: Any) -> List[str]:
+    """从 /models 响应里取出模型 id。
+
+    兼容 ``{"data": [{"id": ...}]}``（OpenAI 标准）、``{"models": [...]}``
+    以及直接给字符串数组的几种写法。
+    """
+    if not isinstance(payload, dict):
+        entries = payload if isinstance(payload, list) else []
+    else:
+        entries = payload.get("data") or payload.get("models") or []
+
+    ids: List[str] = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            value = entry.get("id") or entry.get("name")
+        else:
+            value = entry
+        if isinstance(value, str) and value and value not in ids:
+            ids.append(value)
+    return ids
+
+
+def fetch_models(base_url: str, api_key: str, *, timeout: int = 30) -> List[str]:
+    """``GET {base_url}/models``，返回模型 id 列表。
+
+    独立成函数（而不是 translator 的方法），这样界面在用户还没选定模型时
+    也能拉列表 —— 拉列表本来就不需要 model 参数。
+    """
+    if not base_url:
+        raise TranslationError("base_url 未配置")
+    url = f"{base_url.rstrip('/')}/models"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "subtitle-translator/0.1")
+    try:
+        with urllib.request.urlopen(
+            req, timeout=int(timeout), context=ssl.create_default_context()
+        ) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:400]
+        raise TranslationError(
+            f"拉取模型列表失败: HTTP {exc.code} —— {explain_http_error(detail)}"
+        ) from None
+    except urllib.error.URLError as exc:
+        raise TranslationError(f"连接 {url} 失败: {exc.reason}") from None
+    except TimeoutError:
+        raise TranslationError(f"拉取模型列表超时（{timeout}s）") from None
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        raise TranslationError("模型列表响应不是合法 JSON") from None
+    return extract_model_ids(payload)
+
+
 class OpenAICompatTranslator(Translator):
     """通过 OpenAI 兼容接口做字幕翻译。"""
 
     name = "openai"
+
+    #: 需要 base_url / 密钥 / 模型这些外部参数，界面据此决定是否启用模型选择。
+    requires_api = True
 
     def __init__(
         self,
@@ -122,7 +194,7 @@ class OpenAICompatTranslator(Translator):
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:400]
             raise TranslationError(
-                f"HTTP {exc.code} from {url} —— {self._explain(detail)}"
+                f"HTTP {exc.code} from {url} —— {explain_http_error(detail)}"
             ) from None
         except urllib.error.URLError as exc:
             raise TranslationError(f"连接 {url} 失败: {exc.reason}") from None
@@ -137,50 +209,9 @@ class OpenAICompatTranslator(Translator):
             raise TranslationError(f"响应顶层不是 JSON 对象: {raw[:300]}")
         return payload
 
-    @staticmethod
-    def _explain(detail: str) -> str:
-        """把服务端的错误体压成一行可读信息，便于定位。"""
-        try:
-            err = json.loads(detail).get("error")
-        except (json.JSONDecodeError, AttributeError):
-            return detail.strip() or "(无响应体)"
-        if isinstance(err, dict):
-            code = err.get("code") or err.get("type") or "?"
-            return f"[{code}] {err.get('message', '')}".strip()
-        return str(err) if err else detail.strip()
-
     def list_models(self) -> List[str]:
         """拉取可用模型 id，用于配置自检。"""
-        url = f"{self.base_url}/models"
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("Authorization", f"Bearer {self._api_key}")
-        req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", "subtitle-translator/0.1")
-        try:
-            with urllib.request.urlopen(
-                req, timeout=self.timeout, context=ssl.create_default_context()
-            ) as resp:
-                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:400]
-            raise TranslationError(
-                f"拉取模型列表失败: HTTP {exc.code} —— {self._explain(detail)}"
-            ) from None
-        except urllib.error.URLError as exc:
-            raise TranslationError(f"连接 {url} 失败: {exc.reason}") from None
-        except json.JSONDecodeError:
-            raise TranslationError("模型列表响应不是合法 JSON") from None
-
-        entries = payload.get("data") or payload.get("models") or []
-        ids: List[str] = []
-        for entry in entries:
-            if isinstance(entry, dict):
-                value = entry.get("id") or entry.get("name")
-            else:
-                value = entry
-            if isinstance(value, str) and value:
-                ids.append(value)
-        return ids
+        return fetch_models(self.base_url, self._api_key, timeout=min(self.timeout, 60))
 
     # ------------------------------------------------------------------ 翻译
     def _system_prompt(self, target_lang: str) -> str:

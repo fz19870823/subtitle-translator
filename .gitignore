@@ -58,3 +58,6 @@ logs/
 .env
 *.local.json
 config.local.json
+# save_config() 写文件时的备份与临时文件
+config.local.json.bak
+config.local.json.tmp

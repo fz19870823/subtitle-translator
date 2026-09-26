@@ -42,6 +42,9 @@ class Translator(abc.ABC):
     #: 单次请求最多携带多少条字幕
     batch_size = 10
 
+    #: 是否需要外部 API 参数（地址/密钥/模型）。界面据此启用模型选择控件。
+    requires_api = False
+
     @abc.abstractmethod
     def translate_batch(self, requests: Sequence[TranslationRequest]) -> List[str]:
         """翻译一批文本，返回等长列表。"""

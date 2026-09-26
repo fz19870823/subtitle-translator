@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -79,6 +80,36 @@ class TranslationConfig:
             f"或设置环境变量 {ENV_API_KEY}"
         )
 
+    def key_origin(self) -> str:
+        """报告密钥当前来自哪里，**不返回内容**，可直接显示在界面上。"""
+        if os.environ.get(ENV_API_KEY, "").strip():
+            return f"env:{ENV_API_KEY}"
+        if self.api_key.strip():
+            return "config:api_key"
+        if self.api_key_file.strip():
+            return f"file:{self.api_key_file}"
+        return "(未配置)"
+
+    def to_dict(self) -> dict:
+        """序列化为可写回磁盘的字典。
+
+        ``extra`` 里是本版本不认识的键（未来版本新增的字段），原样保留，
+        避免「读一次再存一次」就把它们抹掉。已知字段优先于 extra 里的同名键。
+        """
+        known = {
+            "engine": self.engine,
+            "base_url": self.base_url,
+            "model": self.model,
+            "api_key": self.api_key,
+            "api_key_file": self.api_key_file,
+            "batch_size": self.batch_size,
+            "timeout": self.timeout,
+            "temperature": self.temperature,
+            "preserve_line_breaks": self.preserve_line_breaks,
+            "style_hint": self.style_hint,
+        }
+        return {**(self.extra or {}), **known}
+
 
 @dataclass
 class AppConfig:
@@ -89,20 +120,12 @@ class AppConfig:
     def describe(self) -> dict:
         """用于日志/自检的可打印摘要。密钥一律只报告来源，不报告内容。"""
         t = self.translation
-        if os.environ.get(ENV_API_KEY, "").strip():
-            key_origin = f"env:{ENV_API_KEY}"
-        elif t.api_key.strip():
-            key_origin = "config:api_key"
-        elif t.api_key_file.strip():
-            key_origin = f"file:{t.api_key_file}"
-        else:
-            key_origin = "(未配置)"
         return {
             "config_file": str(self.source) if self.source else "(默认值，无配置文件)",
             "engine": t.engine,
             "base_url": t.base_url,
             "model": t.model,
-            "key_origin": key_origin,
+            "key_origin": t.key_origin(),
             "batch_size": t.batch_size,
             "timeout": t.timeout,
             "temperature": t.temperature,
@@ -167,6 +190,36 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 
     cfg.base_url = (cfg.base_url or "").rstrip("/")
     return AppConfig(translation=cfg, source=target)
+
+
+def save_config(config: AppConfig, path: str | Path | None = None) -> Path:
+    """把配置写回磁盘，返回实际写入的路径。
+
+    - 目标路径：显式传入的 ``path`` > ``config.source``（加载时记住的那个）> ``CONFIG_FILE``；
+    - 覆盖前把原文件复制一份 ``<名字>.bak``，写坏了还能捞回来；
+    - 先写 ``.tmp`` 再 ``os.replace`` 原子替换，避免半截 JSON。
+    """
+    target = Path(path) if path is not None else (config.source or CONFIG_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if target.exists():
+        try:
+            shutil.copy2(target, target.with_name(target.name + ".bak"))
+        except OSError:
+            # 备份失败不该阻止保存：原文件仍在，最坏情况是没有回滚点。
+            pass
+
+    text = json.dumps(
+        {"translation": config.translation.to_dict()}, ensure_ascii=False, indent=2
+    ) + "\n"
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return target
 
 
 def ensure_runtime_dirs() -> None:

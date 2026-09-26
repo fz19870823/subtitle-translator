@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -125,3 +126,119 @@ def test_unknown_engine_shows_error_dialog(window, monkeypatch):
 def test_engine_combo_is_not_editable(window):
     # 不可编辑是有意为之：引擎必须从注册表里选，不能手打
     assert window.engine_combo.isEditable() is False
+
+
+# ------------------------------------------------------------------ 模型选择
+
+
+def test_settings_button_exists(window):
+    assert window.settings_button.text() == "设置…"
+
+
+def test_model_selector_follows_engine_capability(window):
+    # 配置里是 echo：没有 API 概念，模型控件应整体禁用
+    assert window.engine_combo.currentText() == "echo"
+    assert window.model_selector.combo.isEnabled() is False
+
+    window.engine_combo.setCurrentText("openai")
+    assert window.model_selector.combo.isEnabled() is True
+
+    window.engine_combo.setCurrentText("echo")
+    assert window.model_selector.combo.isEnabled() is False
+
+
+def test_model_selector_is_editable(window):
+    # 必须可编辑：拉不到列表或想用没列出的模型时得能手输
+    assert window.model_selector.combo.isEditable() is True
+
+
+def test_engine_source_reports_configured_endpoint(window):
+    window._config.translation.base_url = "https://cfg.invalid/v1"
+    window._config.translation.api_key = "cfg-key"
+
+    base_url, key, timeout = window._engine_source()
+    assert base_url == "https://cfg.invalid/v1"
+    assert key == "cfg-key"
+    assert 0 < timeout <= 60
+
+
+def test_translate_uses_model_picked_in_the_ui(window, monkeypatch):
+    """界面换模型要即时生效，不能悄悄沿用配置文件里的旧值。"""
+    load_sample(window)
+    window.engine_combo.setCurrentText("openai")
+    window.model_selector.set_current_model("ui-picked-model")
+
+    seen: dict = {}
+
+    class FakeEngine:
+        name = "openai"
+
+        def translate_cues(self, cues, **kwargs):
+            for cue in cues:
+                cue.translation = "[fake] " + cue.text
+            return cues
+
+    def fake_create(name, app_config=None):
+        seen["model"] = app_config.translation.model
+        return FakeEngine()
+
+    monkeypatch.setattr(mw, "create_engine_for", fake_create)
+    window._on_translate()
+
+    assert seen["model"] == "ui-picked-model"
+    assert "[fake] hello" in window.editor.toPlainText()
+
+
+# ------------------------------------------------------------------ 设置保存
+
+
+def test_settings_dialog_result_is_persisted(window, monkeypatch, tmp_path):
+    from dataclasses import replace
+
+    target = tmp_path / "config.local.json"
+    # 让保存落到临时目录：绝不能在测试里碰仓库里的真配置
+    window._config.source = target
+
+    class FakeDialog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            from PySide6.QtWidgets import QDialog
+
+            return QDialog.DialogCode.Accepted
+
+        def result_config(self):
+            return replace(
+                window._config,
+                translation=replace(window._config.translation, model="saved-model"),
+            )
+
+    monkeypatch.setattr(mw, "SettingsDialog", FakeDialog)
+    window._on_settings()
+
+    assert target.exists()
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["translation"]["model"] == "saved-model"
+    assert window._config.translation.model == "saved-model"
+    assert window.model_selector.current_model() == "saved-model"
+    assert "已保存" in window.statusBar().currentMessage()
+
+
+def test_cancelled_settings_dialog_writes_nothing(window, monkeypatch, tmp_path):
+    target = tmp_path / "config.local.json"
+    window._config.source = target
+
+    class CancelDialog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            from PySide6.QtWidgets import QDialog
+
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(mw, "SettingsDialog", CancelDialog)
+    window._on_settings()
+
+    assert not target.exists(), "点了取消就不该写文件"

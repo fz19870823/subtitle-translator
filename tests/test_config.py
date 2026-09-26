@@ -12,6 +12,7 @@ from app.config import (
     ConfigError,
     TranslationConfig,
     load_config,
+    save_config,
 )
 
 
@@ -141,3 +142,113 @@ def test_describe_reports_key_file_origin_without_content(tmp_path, monkeypatch)
     info = cfg.describe()
     assert info["key_origin"].startswith("file:")
     assert secret not in json.dumps(info, ensure_ascii=False)
+
+
+# ------------------------------------------------------------------ 密钥来源
+
+
+def test_key_origin_reports_source(tmp_path, monkeypatch):
+    monkeypatch.delenv(ENV_API_KEY, raising=False)
+    assert TranslationConfig().key_origin() == "(未配置)"
+    assert TranslationConfig(api_key="k").key_origin() == "config:api_key"
+    assert TranslationConfig(api_key_file="C:/k/k.txt").key_origin() == "file:C:/k/k.txt"
+    assert TranslationConfig(api_key="k", api_key_file="C:/k/k.txt").key_origin() == "config:api_key"
+
+    monkeypatch.setenv(ENV_API_KEY, "env-key")
+    assert TranslationConfig(api_key="k").key_origin() == f"env:{ENV_API_KEY}"
+
+
+# ------------------------------------------------------------------ 保存
+
+
+def test_to_dict_covers_every_known_field():
+    t = TranslationConfig(
+        engine="openai",
+        base_url="https://x/v1",
+        model="m",
+        api_key="k",
+        api_key_file="f",
+        batch_size=3,
+        timeout=9,
+        temperature=0.5,
+        preserve_line_breaks=False,
+        style_hint="人名保留原文",
+    )
+    dumped = t.to_dict()
+    assert set(dumped) == {
+        "engine", "base_url", "model", "api_key", "api_key_file",
+        "batch_size", "timeout", "temperature", "preserve_line_breaks",
+        "style_hint",
+    }
+    assert dumped["preserve_line_breaks"] is False
+    assert dumped["style_hint"] == "人名保留原文"
+
+
+def test_save_config_round_trip(tmp_path):
+    path = tmp_path / "config.local.json"
+    cfg = load_config(path)  # 文件不存在 -> 默认值
+    assert cfg.source is None
+
+    cfg.translation.base_url = "https://edited.invalid/v1"
+    cfg.translation.model = "edited-model"
+    cfg.translation.api_key_file = "C:/keys/k.txt"
+
+    written = save_config(cfg, path)
+    assert written == path
+
+    again = load_config(path)
+    assert again.translation.base_url == "https://edited.invalid/v1"
+    assert again.translation.model == "edited-model"
+    assert again.translation.api_key_file == "C:/keys/k.txt"
+
+
+def test_save_config_writes_back_to_recorded_source(tmp_path):
+    path = write_config(tmp_path, {"translation": {"model": "before"}})
+    cfg = load_config(path)
+    cfg.translation.model = "after"
+    # 不显式传 path：应当写回 load 时记住的那个文件
+    assert save_config(cfg) == path
+    assert load_config(path).translation.model == "after"
+
+
+def test_save_config_backs_up_the_previous_file(tmp_path):
+    path = write_config(tmp_path, {"translation": {"model": "old"}})
+    cfg = load_config(path)
+    cfg.translation.model = "new"
+    save_config(cfg, path)
+
+    backup = path.with_name(path.name + ".bak")
+    assert backup.exists(), "覆盖前必须留一份备份"
+    assert json.loads(backup.read_text(encoding="utf-8"))["translation"]["model"] == "old"
+    assert load_config(path).translation.model == "new"
+
+
+def test_save_config_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "config.local.json"
+    save_config(load_config(path), path)
+    assert not (tmp_path / "config.local.json.tmp").exists()
+    assert path.exists()
+
+
+def test_save_config_preserves_unknown_keys(tmp_path):
+    path = write_config(
+        tmp_path, {"translation": {"model": "m", "future_option": 42, "nested": {"a": 1}}}
+    )
+    cfg = load_config(path)
+    save_config(cfg, path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["translation"]["future_option"] == 42
+    assert payload["translation"]["nested"] == {"a": 1}
+    assert payload["translation"]["model"] == "m"
+
+
+def test_save_config_output_is_utf8_without_bom(tmp_path):
+    path = tmp_path / "config.local.json"
+    cfg = load_config(path)
+    cfg.translation.style_hint = "人名保留原文"
+    save_config(cfg, path)
+
+    raw = path.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf")
+    assert "人名保留原文" in raw.decode("utf-8")

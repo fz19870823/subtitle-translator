@@ -24,13 +24,16 @@ subtitle-translator/
 │   │   └── engines/
 │   │       └── openai_compat.py    # OpenAI 兼容后端
 │   └── ui/
-│       └── main_window.py          # 主窗口
+│       ├── main_window.py          # 主窗口
+│       ├── model_selector.py       # 模型下拉：可拉取列表、可手输
+│       └── settings_dialog.py      # 设置对话框：API / 密钥 / 模型 / 参数
 └── tests/
     ├── test_subtitle_io.py         # 解析器往返测试
-    ├── test_config.py              # 配置加载与密钥脱敏
+    ├── test_config.py              # 配置加载、保存与密钥脱敏
     ├── test_translator.py          # 注册表、批量与进度回调
-    ├── test_openai_compat.py       # 协议解析、换行处理、失败回退（不联网）
-    └── test_ui_smoke.py            # 界面冒烟（需要 PySide6，否则跳过）
+    ├── test_openai_compat.py       # 协议解析、换行处理、模型列表（不联网）
+    ├── test_ui_smoke.py            # 主窗口冒烟（需要 PySide6，否则跳过）
+    └── test_ui_settings.py         # 模型控件与设置对话框（同上）
 ```
 
 ## 环境与安装
@@ -48,6 +51,31 @@ uv pip install -e ".[dev]"
 ```
 
 ## 配置
+
+API 地址、密钥、模型**都能在界面里改**，不必手写 JSON。两种方式落到同一个
+`config.local.json`，改哪个都行。
+
+### 方式一：界面里配置（推荐）
+
+主窗口点「设置…」：
+
+| 项 | 说明 |
+| --- | --- |
+| API 地址 | 填到 `/v1` 为止，代码自行拼 `/chat/completions` 与 `/models` |
+| 密钥文件 | 填密钥文件的路径（推荐，配置里不留副本），带「浏览…」 |
+| 明文密钥 | 直接写密钥；留空则回退到密钥文件 |
+| 生效密钥 | 实时显示运行时**实际会用哪个**。环境变量优先级最高，被它覆盖时会明确提示 |
+| 模型 | 点「拉取模型」从服务端 `/models` 取回列表下拉选择；**也可以直接手输**列表里没有的 id |
+| 其余 | 批量大小 / 超时 / 温度 / 保留换行 / 风格提示 |
+
+几个实现上的取舍：
+
+- **拉取模型在网络线程里跑**，后台 QThread + 信号回主线程。点一下按钮窗口不该假死。
+- **拉取超时封顶 60 秒**，不复用翻译的 `timeout`（那个默认 120 秒，等列表等不起）。
+- 保存时先把原文件备份成 `config.local.json.bak`，再写临时文件原子替换，避免写坏配置。
+- 主窗口上的模型下拉是**临时**切换，当次运行生效；要持久化就进「设置…」保存。
+
+### 方式二：直接编辑配置文件
 
 复制模板后填写：
 
@@ -124,6 +152,9 @@ copy config.example.json config.local.json
 若引擎需要外部参数，再加一个 `from_config(cfg)` 类方法，界面与 `create_engine_for()`
 会自动走它。
 
+需要 API 地址 / 密钥 / 模型的引擎，把类属性 `requires_api` 设为 `True`，主界面据此启用
+模型选择控件；默认 `False`（`echo` 这类离线引擎就用不到）。
+
 ```python
 from app.core.translator import TranslationRequest, Translator, register
 
@@ -154,9 +185,11 @@ class MyLlmTranslator(Translator):
 - [x] 编码回退：utf-8-sig → utf-8 → gb18030
 - [x] 翻译引擎注册表与批量/进度回调
 - [x] 本地配置加载 + 密钥脱敏
+- [x] 界面内配置 API 地址 / 密钥，模型可拉取列表选择或手输
+- [x] 配置保存（覆盖前备份、临时文件原子替换）
 - [x] OpenAI 兼容后端（批量 JSON 协议、换行保真、逐条回退）
 - [x] 在线自检脚本 `scripts/check_api.py`
 - [ ] ASS / SSA 支持
 - [ ] 双语对照导出（原文 + 译文同时保留）
-- [ ] 长任务放到 QThread，避免翻译时界面卡死
+- [ ] 翻译本身放到 QThread，避免长字幕翻译时界面卡死
 - [ ] 并发请求以提升长字幕的翻译速度

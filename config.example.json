@@ -1,5 +1,6 @@
 {
   "//": "复制为 config.local.json 后按需修改。config.local.json 已被 .gitignore 屏蔽。",
+  "//界面配置": "这些字段同样可以在程序里改：主窗口「设置…」→ 填 API 地址与密钥 → 点「拉取模型」从列表里选（也可手输）→ 保存。保存时会先备份原文件为 .bak。",
   "//密钥": "推荐用 api_key_file 指向密钥文件，配置里不放密钥副本；也可用 api_key 直接写，或设置环境变量 SUBTITLE_TRANSLATOR_API_KEY。",
   "//环境变量": "SUBTITLE_TRANSLATOR_API_KEY / SUBTITLE_TRANSLATOR_BASE_URL / SUBTITLE_TRANSLATOR_MODEL 会覆盖本文件。",
   "translation": {

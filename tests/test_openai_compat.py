@@ -4,12 +4,19 @@
 """
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
 
 import pytest
 
 from app.config import ConfigError, TranslationConfig
-from app.core.engines.openai_compat import _LINE_MARK, OpenAICompatTranslator
+from app.core.engines.openai_compat import (
+    _LINE_MARK,
+    OpenAICompatTranslator,
+    extract_model_ids,
+    fetch_models,
+)
 from app.core.translator import TranslationRequest, TranslationError, create_engine_for
 
 
@@ -242,3 +249,118 @@ def test_create_engine_for_uses_config(tmp_path):
     engine = create_engine_for("openai", cfg)
     assert isinstance(engine, OpenAICompatTranslator)
     assert engine.model == "m"
+
+
+# ------------------------------------------------------------------ 模型列表
+
+class _FakeResponse:
+    """urlopen 的最小替身：只需支持 with 与 read。"""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _stub_urlopen(monkeypatch, payload, requests: list | None = None):
+    """把 urllib.request.urlopen 换掉。payload 是 bytes 就原样回，否则序列化成 JSON。"""
+
+    def fake_urlopen(req, timeout=None, context=None):
+        if requests is not None:
+            requests.append(req)
+        if isinstance(payload, (bytes, bytearray)):
+            body = bytes(payload)
+        else:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return _FakeResponse(body)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+
+def test_extract_model_ids_handles_common_shapes():
+    assert extract_model_ids({"data": [{"id": "a"}, {"id": "b"}]}) == ["a", "b"]
+    assert extract_model_ids({"models": [{"name": "n"}]}) == ["n"]
+    assert extract_model_ids(["m1", "m2"]) == ["m1", "m2"]
+    assert extract_model_ids({"data": [{"id": "a"}, {"id": "a"}]}) == ["a"], "重复项要去掉"
+    assert extract_model_ids({"data": [{"id": ""}, {"nope": 1}, 42]}) == []
+    assert extract_model_ids({}) == []
+
+
+def test_fetch_models_hits_models_endpoint_with_bearer(monkeypatch):
+    requests: list = []
+    _stub_urlopen(monkeypatch, {"data": [{"id": "grok-a"}, {"id": "grok-b"}]}, requests)
+
+    models = fetch_models("https://x.invalid/v1/", "g2a_secret")
+
+    assert models == ["grok-a", "grok-b"]
+    assert requests[0].full_url == "https://x.invalid/v1/models", "末尾斜杠要归一化"
+    assert requests[0].get_header("Authorization") == "Bearer g2a_secret"
+
+
+def test_fetch_models_accepts_bare_list(monkeypatch):
+    _stub_urlopen(monkeypatch, ["m1", "m2"])
+    assert fetch_models("https://x.invalid/v1", "k") == ["m1", "m2"]
+
+
+def test_fetch_models_requires_base_url():
+    with pytest.raises(TranslationError):
+        fetch_models("", "k")
+
+
+def test_fetch_models_rejects_non_json(monkeypatch):
+    _stub_urlopen(monkeypatch, b"<html>gateway error</html>")
+    with pytest.raises(TranslationError, match="不是合法 JSON"):
+        fetch_models("https://x.invalid/v1", "k")
+
+
+def test_fetch_models_surfaces_http_error(monkeypatch):
+    def fake_urlopen(req, timeout=None, context=None):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(
+                json.dumps(
+                    {"error": {"code": "invalid_api_key", "message": "bad key"}}
+                ).encode("utf-8")
+            ),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(TranslationError) as excinfo:
+        fetch_models("https://x.invalid/v1", "k")
+    message = str(excinfo.value)
+    assert "401" in message
+    assert "invalid_api_key" in message
+
+
+def test_fetch_models_surfaces_connection_error(monkeypatch):
+    def fake_urlopen(req, timeout=None, context=None):
+        raise urllib.error.URLError("dns failure")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(TranslationError, match="连接"):
+        fetch_models("https://x.invalid/v1", "k")
+
+
+def test_list_models_method_delegates_to_fetch_models(monkeypatch):
+    _stub_urlopen(monkeypatch, {"data": [{"id": "from-endpoint"}]})
+    assert make_engine().list_models() == ["from-endpoint"]
+
+
+def test_requires_api_flag_distinguishes_engines():
+    from app.core.translator import EchoTranslator, Translator
+
+    assert Translator.requires_api is False
+    assert EchoTranslator.requires_api is False
+    assert OpenAICompatTranslator.requires_api is True
