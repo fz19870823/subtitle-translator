@@ -35,7 +35,7 @@ STATUS_LABELS = {
 #: 失败项的红色。浅色主题下醒目；深色主题下虽然偏暗，但「失败」两个字仍然在。
 FAILURE_COLOR = QColor("#c0392b")
 
-HINT = "尚未添加文件 —— 可一次选择多个字幕，依次翻译并自动保存到输出目录"
+HINT = "尚未添加文件 —— 点「添加文件…」可一次选多个字幕，依次翻译并自动保存到输出目录"
 
 
 class QueuePanel(QWidget):
@@ -45,6 +45,8 @@ class QueuePanel(QWidget):
     add_requested = Signal()
     #: 用户点了「依次翻译」
     start_requested = Signal()
+    #: 用户选中了某一项：(下标)——主窗口据此把那一份摆进编辑器
+    item_selected = Signal(int)
     #: 队列内容变了（增/删/移），主窗口据此刷新它自己那部分状态
     queue_changed = Signal()
 
@@ -52,6 +54,8 @@ class QueuePanel(QWidget):
         super().__init__(parent)
         self._queue = queue
         self._busy = False
+        #: 程序自己改选中行时置起，避免把「刷新界面」当成「用户点了某项」
+        self._suppress = False
         self._build_ui()
         self.refresh()
 
@@ -60,15 +64,23 @@ class QueuePanel(QWidget):
     def _build_ui(self) -> None:
         self.hint_label = QLabel(HINT)
         self.hint_label.setStyleSheet("color: palette(mid);")
+        self.hint_label.setWordWrap(True)
 
         self.list = QListWidget()
         self.list.setMaximumHeight(132)
-        # 多选是为了「一次移除好几个」；排序仍只认单选（见 _on_move）。
+        # 多选是为了「一次移除好几个」；排序仍只认单选（见 _on_move），
+        # 「点开看哪一份」也只认单选（见 _on_row_changed）。
         self.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list.itemSelectionChanged.connect(self._sync_buttons)
+        # 用 currentRowChanged 而不是 itemClicked：键盘上下键换行也该把那一份摆进
+        # 编辑器，只认鼠标点击会留下一条「键盘选了、编辑器没变」的暗路。
+        self.list.currentRowChanged.connect(self._on_row_changed)
 
         self.add_button = QPushButton("添加文件…")
-        self.add_button.setToolTip("可一次选择多个字幕文件；不支持或读不了的文件会被当场剔除")
+        self.add_button.setToolTip(
+            "字幕的**唯一入口**：可一次选择多个文件（支持 .srt / .vtt）。\n"
+            "读不了或格式不对的会当场剔除并说明原因。"
+        )
         self.add_button.clicked.connect(self.add_requested.emit)
 
         self.remove_button = QPushButton("移除")
@@ -111,16 +123,44 @@ class QueuePanel(QWidget):
         比多画几行严重得多。
         """
         selected = {entry.row() for entry in self.list.selectedIndexes()}
-        self.list.clear()
-        for index, item in enumerate(self._queue):
-            entry = QListWidgetItem(self._describe(item))
-            entry.setToolTip(f"{item.path}\n译文保存到 {item.output_path}")
-            if item.status == FAILED:
-                entry.setForeground(FAILURE_COLOR)
-            self.list.addItem(entry)
-            if index in selected:
-                entry.setSelected(True)
+        current = self.list.currentRow()
+        # 重建列表会一路改写选中行，那会触发 currentRowChanged —— 对主窗口来说
+        # 「用户点了某一项」和「界面重画了一下」是两件完全不同的事，
+        # 这里必须把它挡掉，否则光刷新界面就会把编辑器里的文件换来换去。
+        self._suppress = True
+        try:
+            self.list.clear()
+            for index, item in enumerate(self._queue):
+                entry = QListWidgetItem(self._describe(item))
+                entry.setToolTip(f"{item.path}\n译文保存到 {item.output_path}")
+                if item.status == FAILED:
+                    entry.setForeground(FAILURE_COLOR)
+                self.list.addItem(entry)
+            for index in selected:
+                entry = self.list.item(index)
+                if entry is not None:
+                    entry.setSelected(True)
+            if 0 <= current < self.list.count():
+                self.list.setCurrentRow(current)
+        finally:
+            self._suppress = False
         self._sync_buttons()
+
+    def select_row(self, index: int) -> None:
+        """让列表停在第 ``index`` 行，且**不**通知主窗口。
+
+        主窗口用它把列表的选中项对齐到自己正在显示/正在翻的那一份。
+        """
+        self._suppress = True
+        try:
+            self.list.setCurrentRow(index if 0 <= index < self.list.count() else -1)
+        finally:
+            self._suppress = False
+
+    def _on_row_changed(self, row: int) -> None:
+        if self._suppress or row < 0 or row >= len(self._queue):
+            return
+        self.item_selected.emit(row)
 
     def _describe(self, item) -> str:
         text = f"{STATUS_LABELS.get(item.status, item.status)}　{item.name}"
@@ -184,11 +224,16 @@ class QueuePanel(QWidget):
         )
 
     def set_busy(self, busy: bool) -> None:
-        """翻译进行中：锁住会改变队列内容的按钮。
+        """翻译进行中：锁住会改变队列内容、以及会换掉编辑器内容的控件。
 
         中途改队列会让「正在翻第几项」对不上号，而列表上也看不出任何异常。
+
+        列表也必须锁：点一下就能把**另一份**字幕摆进编辑器，而后台线程还在往
+        原来那批 cues 里写译文 —— 结果是一份与当前显示内容对不上的译文，
+        并且看不出哪里错了。
         """
         self._busy = bool(busy)
+        self.list.setEnabled(not self._busy)
         self._sync_buttons()
 
     # ---------------------------------------------------------------- 编辑

@@ -109,9 +109,23 @@ class TranslationQueue:
         """正在翻的那一项的下标；None 表示没有在跑的。"""
         return self._running
 
-    def contains(self, path: str | Path) -> bool:
+    def index_of(self, path: str | Path | None) -> int | None:
+        """这一份在队列里的位置；不在队列里（或 ``path`` 是 None）返回 ``None``。
+
+        界面靠它让「编辑器里显示的那份」和「列表里选中的那行」始终一致。
+        两者一旦对不上，用户在译文区看到的内容和他以为在看的那一份就不是同一个
+        文件 —— 而且界面上没有任何地方能看出这点，正是最难发现的那类错。
+        """
+        if path is None:
+            return None
         key = _norm(Path(path))
-        return any(_norm(item.path) == key for item in self._items)
+        for index, item in enumerate(self._items):
+            if _norm(item.path) == key:
+                return index
+        return None
+
+    def contains(self, path: str | Path) -> bool:
+        return self.index_of(path) is not None
 
     # ---------------------------------------------------------------- 增删
 

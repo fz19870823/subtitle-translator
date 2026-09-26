@@ -259,3 +259,19 @@ def test_contains_matches_the_same_file_through_another_spelling(tmp_path):
     add(batch, tmp_path, "01.srt")
     assert batch.contains(tmp_path / "src" / ".." / "src" / "01.srt") is True
     assert batch.contains(tmp_path / "src" / "02.srt") is False
+
+
+def test_index_of_locates_a_queued_file(tmp_path):
+    """``index_of`` 是界面把「编辑器显示的那份」对齐到「列表选中那行」的支点。
+
+    对不上时，用户在译文区核对的内容和他以为在看的那一份就不是同一个文件 ——
+    界面上没有哪里能看出这点。
+    """
+    batch = build(tmp_path, "01.srt", "02.srt", "03.srt")
+    add(batch, tmp_path, "01.srt", "02.srt", "03.srt")
+
+    assert batch.index_of(tmp_path / "src" / "02.srt") == 1
+    # 换个写法也该认出来（Windows 上还可能有大小写差异）
+    assert batch.index_of(tmp_path / "src" / "." / "03.srt") == 2
+    assert batch.index_of(tmp_path / "src" / "09.srt") is None
+    assert batch.index_of(None) is None, "还没有载入任何文件时不该报错"

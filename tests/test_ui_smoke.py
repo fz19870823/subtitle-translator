@@ -84,19 +84,14 @@ def window(qapp, monkeypatch, tmp_path):
 
 
 def load_sample(win, sample: str = SAMPLE) -> None:
-    """模拟打开文件成功后的状态（绕过 QFileDialog）。"""
-    from pathlib import Path
+    """模拟某一份字幕被摆进编辑器（绕过「点队列里的某一项」这一步）。
 
+    直接走 ``_load_cues`` —— 与真实的两条路径（点列表、队列轮转到下一份）是同一段
+    代码。测试自己照着抄一遍「载入之后该做什么」，会在实现改动后悄悄失真：
+    少同步一个按钮、少算一次「哪几条没翻出来」，用例照样全绿，而真实界面是坏的。
+    """
     cues = subtitle_io.parse_srt(sample)
-    win._cues = cues
-    win._source_path = Path("demo.srt")
-    win.translate_button.setEnabled(True)
-    win.export_button.setEnabled(True)
-    # 真实路径上 ``_on_open`` 会顺手重算「哪几条没翻出来」并把重试按钮刷一遍；
-    # 这里绕过了对话框，但这两步必须跟上 —— 否则上一份字幕留下的结论会挂在按钮上，
-    # 后面断言「按钮该不该出现」就变成在测一个跟当前文件无关的状态。
-    win._recompute_stuck()
-    win._sync_retry_button()
+    win._load_cues("demo.srt", cues)
 
 
 def wait_idle(win, qapp, timeout_ms: int = 15000) -> None:
@@ -308,7 +303,8 @@ def test_translation_runs_off_the_ui_thread(window, qapp, monkeypatch):
     # 能处理事件 = 界面没被冻住，这是「不卡死」的直接判据
     qapp.processEvents()
     assert window.translate_button.isEnabled() is False, "翻译期间不该能重复点击"
-    assert window.open_button.isEnabled() is False, "翻译期间不该能换文件"
+    assert window.queue_panel.add_button.isEnabled() is False, "翻译期间不该能添加文件"
+    assert window.queue_panel.list.isEnabled() is False, "翻译期间不该能切换查看的文件"
     assert window.export_button.isEnabled() is False, "翻译期间不该能导出半成品"
     assert window.context_spin.isEnabled() is False, "翻译期间不该能改上下文窗口"
     assert window.cancel_button.isHidden() is False, "翻译期间要能看到取消按钮"
@@ -316,7 +312,8 @@ def test_translation_runs_off_the_ui_thread(window, qapp, monkeypatch):
     wait_idle(window, qapp)
     assert window.progress.value() == 100
     assert window.translate_button.isEnabled() is True
-    assert window.open_button.isEnabled() is True
+    assert window.queue_panel.add_button.isEnabled() is True
+    assert window.queue_panel.list.isEnabled() is True
     assert window.context_spin.isEnabled() is True, "跑完了要把上下文窗口放回可改"
     assert window.cancel_button.isHidden() is True, "空闲时取消按钮该收起来"
 
@@ -927,6 +924,80 @@ def test_queue_panel_stays_out_of_the_way_until_you_add_files(window):
     assert panel.list.isHidden() is True
     assert panel.start_button.isHidden() is True
     assert panel.add_button.isEnabled() is True, "空队列也得能添加文件"
+
+
+# ------------------------------------------------------------ 添加字幕的唯一入口
+
+
+def test_adding_files_has_exactly_one_entry(window):
+    """添加字幕只有一个入口。
+
+    原来顶部还有一个「打开字幕…」按钮：和队列的「添加文件…」功能重复，
+    而且只认单选 —— 同一个动作两个按钮、行为还不一样，用户得先猜哪个是哪个。
+    """
+    assert not hasattr(window, "open_button"), "不该再有第二个添加文件的入口"
+    assert window.queue_panel.add_button.isEnabled() is True
+
+
+def test_adding_several_files_shows_the_first_one(window, tmp_path):
+    """一次选多个文件：全部进队列，编辑器直接显示第一份。
+
+    编辑器空着时得摆一份上去，否则用户加完文件看到的还是一片空白，
+    不知道刚才那一步到底成没成。
+    """
+    window._enqueue(make_queue_files(tmp_path, 3))
+
+    assert window._queue.summary()["total"] == 3
+    assert window._source_path is not None, "编辑器里该显示一份"
+    assert window._source_path.name == "01.srt", "显示的是最先加进来的那份"
+    assert "01.srt" in window.path_label.text()
+    assert window.queue_panel.list.currentRow() == 0, "列表高亮要跟编辑器对得上"
+    assert "已加入 3 个文件" in window.statusBar().currentMessage()
+
+
+def test_adding_files_does_not_throw_away_what_is_already_open(window, tmp_path):
+    """编辑器里已经有一份在看时，加文件不能把它换掉。
+
+    换掉等于把那份**还没导出**的译文从内存里抹掉；而翻译成功之后断点会被清掉，
+    抹掉就真找不回来了 —— 用户只是又选了几个文件，不该付这个代价。
+    """
+    load_sample(window)  # demo.srt，内容里带 hello
+    window._cues[0].translation = "[zh-CN] 手改过的译文"
+
+    window._enqueue(make_queue_files(tmp_path, 2))
+
+    assert window._source_path.name == "demo.srt", "编辑器该原地不动"
+    assert window._cues[0].translation == "[zh-CN] 手改过的译文", "手改的译文丢了"
+    assert window._queue.summary()["total"] == 2, "文件还是该照常入队"
+
+
+def test_clicking_a_queue_row_swaps_what_the_editor_shows(window, tmp_path):
+    """点队列里的某一行 → 编辑器换成那一份。
+
+    队列是唯一的文件列表，所以「现在看哪一份」也由它说了算：编辑器里显示的
+    始终是列表里选中的那一行，用户才不会对着一份跟自己以为的不是同一个的文件
+    去核对译文。
+    """
+    window._enqueue(make_queue_files(tmp_path, 3))
+    assert window._source_path.name == "01.srt"
+
+    window.queue_panel.list.setCurrentRow(1)
+
+    assert window._source_path.name == "02.srt"
+    assert "02.srt" in window.path_label.text()
+    assert "file2-line1" in window.editor.toPlainText(), "换的是真的那一份内容"
+
+
+def test_queue_run_moves_the_highlight_along(window, qapp, monkeypatch, tmp_path):
+    """队列一轮跑完，列表高亮的应该是最后翻的那一份。
+
+    高亮留在第一份上，看起来就像「翻译翻错了文件」—— 而译文其实是对的。
+    """
+    window._enqueue(make_queue_files(tmp_path, 3))
+    start_queue(window, qapp, monkeypatch)
+
+    assert window.queue_panel.list.currentRow() == 2
+    assert window._source_path.name == "03.srt"
 
 
 def test_enqueue_reads_the_files_and_drops_the_unreadable_one(window, tmp_path):

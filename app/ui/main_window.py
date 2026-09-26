@@ -99,12 +99,14 @@ class MainWindow(QMainWindow):
         central = QWidget(self)
         self.setCentralWidget(central)
 
-        self.open_button = QPushButton("打开字幕…")
-        self.open_button.clicked.connect(self._on_open)
+        # 添加字幕只有**一个入口**：队列面板上的「添加文件…」（支持一次多选）。
+        # 这里原来还有一个「打开字幕…」按钮，它和队列的添加功能重复，而且只认
+        # 单选 —— 同一个动作有两个按钮、行为还不一样，用户得先猜哪个是哪个。
+        # 现在这一行只回答「编辑器里现在看的是哪一份」。
         self.path_label = QLabel("未选择文件")
 
         file_row = QHBoxLayout()
-        file_row.addWidget(self.open_button)
+        file_row.addWidget(QLabel("当前文件"))
         file_row.addWidget(self.path_label, 1)
 
         self.source_combo = self._language_combo(
@@ -140,6 +142,10 @@ class MainWindow(QMainWindow):
 
         self.translate_button = QPushButton("翻译")
         self.translate_button.clicked.connect(self._on_translate)
+        self.translate_button.setToolTip(
+            "只翻译当前显示的这份（不自动保存）—— 用来先看看效果。\n"
+            "要把队列里的文件翻完并自动保存，用下面的「依次翻译」。"
+        )
         self.translate_button.setEnabled(False)
 
         # 翻译是分钟级的（上千条字幕要发几十次请求），必须给用户一条退路。
@@ -162,6 +168,7 @@ class MainWindow(QMainWindow):
         self.queue_panel = QueuePanel(self._queue)
         self.queue_panel.add_requested.connect(self._on_queue_add)
         self.queue_panel.start_requested.connect(self._on_queue_start)
+        self.queue_panel.item_selected.connect(self._on_queue_item_selected)
         self.queue_panel.queue_changed.connect(self._on_queue_changed)
 
         control_row = QHBoxLayout()
@@ -185,7 +192,9 @@ class MainWindow(QMainWindow):
         model_row.addWidget(self.context_spin)
 
         self.editor = QPlainTextEdit()
-        self.editor.setPlaceholderText("打开字幕文件后，原文与译文会显示在这里…")
+        self.editor.setPlaceholderText(
+            "点下面「添加文件…」选入字幕后，原文与译文会显示在这里…"
+        )
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -294,33 +303,39 @@ class MainWindow(QMainWindow):
 
     # ---------- 交互 ----------
 
-    def _on_open(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "打开字幕文件", "", "字幕文件 (*.srt *.vtt);;所有文件 (*)"
-        )
-        if not path:
+    def _on_queue_item_selected(self, index: int) -> None:
+        """用户点了队列里的某一项：把那一份摆进编辑器。
+
+        队列是**唯一**的文件列表，所以「现在看哪一份」也由它决定 —— 编辑器里显示的
+        始终是列表里被选中的那一份，两者不会打架，用户也就不会在译文区核对一份
+        跟他以为的不是同一个的文件。真正耗时的翻译不在这里，所以直接读没问题。
+        """
+        if self._worker is not None or self._queue_mode:
+            return  # 跑的时候列表是锁着的，这里只是兜底
+        if not 0 <= index < len(self._queue):
             return
+        item = self._queue[index]
         try:
-            cues = subtitle_io.parse_file(path)
+            cues = subtitle_io.parse_file(item.path)
         except (SubtitleFormatError, OSError) as exc:
-            QMessageBox.critical(self, "解析失败", str(exc))
+            QMessageBox.critical(self, "解析失败", f"{item.name}：{exc}")
             return
 
-        plan = self._load_cues(path, cues)
-
+        item.cue_count = len(cues)
+        plan = self._load_cues(item.path, cues)
         # 上次翻到一半的记录要主动说出来：用户不知道有断点，就会以为只能重来。
         if plan.count:
             self.statusBar().showMessage(
-                f"已载入 {len(cues)} 条字幕　|　上次翻到 {plan.count} 条，"
+                f"{item.name}：{len(cues)} 条　|　上次翻到 {plan.count} 条，"
                 "点「继续翻译」接着往下走"
             )
         else:
-            self.statusBar().showMessage(f"已载入 {len(cues)} 条字幕")
+            self.statusBar().showMessage(f"{item.name}：{len(cues)} 条")
 
     def _load_cues(
         self, path: str | Path, cues: List[Cue]
     ) -> checkpoint_store.ResumePlan:
-        """把一份字幕装进界面。打开单个文件、队列轮到某一项，走的都是这里。
+        """把一份字幕装进界面。点队列里某一项、队列轮到某一项，走的都是这里。
 
         返回它的断点计划：调用方需要知道「能复用几条」才能决定要不要续传。
         """
@@ -335,6 +350,12 @@ class MainWindow(QMainWindow):
         # 换了文件，「哪几条没翻出来」就重新算 —— 上一份字幕的结论对这份没有意义。
         self._recompute_stuck()
         self._sync_retry_button()
+
+        # 列表里被选中的那一行必须跟着编辑器走。反过来的方向（点列表 → 载入）由
+        # _on_queue_item_selected 负责；这里补的是另一个方向，否则「翻译自己翻完
+        # 推进到下一份」之后，列表还高亮着上一份，看起来像翻译翻错了文件。
+        row = self._queue.index_of(self._source_path)
+        self.queue_panel.select_row(-1 if row is None else row)
 
         plan = self._resume_plan()
         self._sync_translate_button()
@@ -699,14 +720,27 @@ class MainWindow(QMainWindow):
         # 入队时先解析试读一遍，读不了或格式不对的当场剔掉。
         # 队列跑起来时人不在场 —— 等轮到它才发现「这份根本读不了」就太晚了，
         # 整条队列会停在一个用户以为没问题的文件上。
+        kept: List[Tuple[queue_store.QueueItem, List[Cue]]] = []
         for item in list(added):
             try:
-                item.cue_count = len(subtitle_io.parse_file(item.path))
+                cues = subtitle_io.parse_file(item.path)
             except (SubtitleFormatError, OSError) as exc:
                 self._queue.remove(item)
                 notes.append(f"{item.path.name}：{exc}")
+            else:
+                item.cue_count = len(cues)
+                kept.append((item, cues))
 
+        # 先刷列表再载入：`_load_cues` 会把列表的选中行对齐到它显示的那一份，
+        # 那时候新条目必须已经在列表里了，否则行号落在列表外面、等于没选中。
         self.queue_panel.refresh()
+        # 编辑器空着的时候顺手把第一份摆上去，用户立刻看到刚加的是什么（不用先去
+        # 点列表）。已经有内容在看就**不动它** —— 换掉编辑器等于把那一份尚未导出的
+        # 译文从内存里抹掉，而翻译成功后会清掉断点，抹掉就真找不回来了。
+        if kept and self._source_path is None:
+            first_item, first_cues = kept[0]
+            self._load_cues(first_item.path, first_cues)
+
         counts = self._queue.summary()
         message = (
             f"已加入 {len(self._queue) - before} 个文件，队列共 {counts['total']} 个"
@@ -729,6 +763,11 @@ class MainWindow(QMainWindow):
 
     def _on_queue_changed(self) -> None:
         """队列被增删移之后同步一句提示（面板自己已经把列表重绘过了）。"""
+        # 被移出的可能正是编辑器里显示的那一份：把选中行重新对齐到编辑器，
+        # 免得列表高亮着一份、译文区显示着另一份。
+        row = self._queue.index_of(self._source_path)
+        self.queue_panel.select_row(-1 if row is None else row)
+
         counts = self._queue.summary()
         if not counts["total"]:
             self.statusBar().showMessage("队列已清空")
@@ -1065,7 +1104,6 @@ class MainWindow(QMainWindow):
         self.cancel_button.setVisible(busy)
         if busy:
             self.cancel_button.setEnabled(True)
-        self.open_button.setEnabled(not busy)
         self.settings_button.setEnabled(not busy)
         self.engine_combo.setEnabled(not busy)
         self.source_combo.setEnabled(not busy)
