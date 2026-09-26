@@ -255,9 +255,22 @@ class MainWindow(QMainWindow):
             return
 
         self.editor.setPlainText(subtitle_io.to_srt(self._cues))
-        self.statusBar().showMessage(
-            f"{engine_name} 翻译完成：{source_lang} → {target_lang}"
-        )
+        notes = engine.quality_notes()
+        summary = f"{engine_name} 翻译完成：{source_lang} → {target_lang}"
+        if notes:
+            summary += "　|　" + "；".join(notes)
+        self.statusBar().showMessage(summary)
+
+        # 回抄是**静默**故障：不报告就没人会发现手里那份字幕根本没翻。
+        # 救回来了在状态栏记账；没救回来的必须弹出来。
+        if engine.untranslated_count:
+            QMessageBox.warning(
+                self,
+                "部分字幕可能没有翻译",
+                f"有 {engine.untranslated_count} 条字幕与原文完全相同，"
+                "整批重发和逐条重译都没能让模型改写它们。\n\n"
+                "请先在译文区核对这几条再导出；换成别的模型通常可以解决。",
+            )
 
     def _on_progress(self, done: int, total: int) -> None:
         self.progress.setValue(0 if not total else int(done / total * 100))

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from app.config import AppConfig, TranslationConfig  # noqa: E402
 from app.core import subtitle_io  # noqa: E402
-from app.core.translator import ENGINES  # noqa: E402
+from app.core.translator import ENGINES, Translator  # noqa: E402
 from app.ui import main_window as mw  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
 
@@ -170,13 +170,13 @@ def test_translate_uses_model_picked_in_the_ui(window, monkeypatch):
 
     seen: dict = {}
 
-    class FakeEngine:
+    class FakeEngine(Translator):
+        # 必须是真 Translator 子类：主窗口会读它的质量统计
+        # （quality_notes 之类），假引擎绕过契约就会漏掉界面依赖。
         name = "openai"
 
-        def translate_cues(self, cues, **kwargs):
-            for cue in cues:
-                cue.translation = "[fake] " + cue.text
-            return cues
+        def translate_batch(self, requests):
+            return ["[fake] " + r.text for r in requests]
 
     def fake_create(name, app_config=None):
         seen["model"] = app_config.translation.model

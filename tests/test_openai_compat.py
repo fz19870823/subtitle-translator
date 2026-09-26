@@ -34,6 +34,14 @@ def req(text: str) -> TranslationRequest:
     return TranslationRequest(text=text, source_lang="en", target_lang="zh-CN")
 
 
+def user_payload(messages) -> list[str]:
+    """取出发给模型的数组。源语言不是 auto 时 user 消息前面会带一行「源语言: xx」。"""
+    content = messages[1]["content"]
+    if content.startswith("源语言: "):
+        content = content.split("\n", 1)[1]
+    return json.loads(content)
+
+
 # ------------------------------------------------------------------ 构造校验
 
 def test_missing_required_fields_raise():
@@ -415,8 +423,8 @@ def test_exhausted_echo_retries_raise_instead_of_shipping_garbage(monkeypatch):
     assert engine.echo_retry_count == 1, "echo_retries=1 表示只重发一次"
 
 
-def test_echo_retries_zero_means_single_attempt(monkeypatch):
-    engine = make_engine(echo_retries=0)
+def test_echo_retries_zero_means_no_batch_resend(monkeypatch):
+    engine = make_engine(echo_retries=0, echo_downgrade=False)
     src = ["hello", "world", "good morning"]
     calls: list[int] = []
 
@@ -431,27 +439,84 @@ def test_echo_retries_zero_means_single_attempt(monkeypatch):
     assert engine.echo_retry_count == 0
 
 
-def test_minority_echo_is_accepted_without_retry(monkeypatch):
+def test_minority_echo_is_repaired_item_by_item(monkeypatch):
+    """3 条里 1 条没翻：不值得整批重发，但那条必须被单独拎出来重译。
+
+    这条正是用户报的现象 —— 「有几率原样推回」。旧逻辑按批次过半判定，
+    1/3 不过半就直接放行，未翻译的条目就这样混进成品。
+    """
     engine = make_engine()
-    calls: list[int] = []
+    calls: list[object] = []
 
     def fake_chat(messages, *, max_tokens=4096):
-        calls.append(1)
-        # 3 条里 1 条与原相同（专有名词式），不过半，不该重试
-        return json.dumps(["你好", "world", "早上好"], ensure_ascii=False)
+        calls.append(user_payload(messages))
+        if len(calls) == 1:
+            return json.dumps(["你好", "world", "早上好"], ensure_ascii=False)
+        return json.dumps(["世界"], ensure_ascii=False)
 
     monkeypatch.setattr(engine, "_chat", fake_chat)
     out = engine.translate_batch(bulk())
 
-    assert out == ["你好", "world", "早上好"]
-    assert len(calls) == 1
-    assert engine.echo_retry_count == 0
+    assert out == ["你好", "世界", "早上好"]
+    assert engine.echo_retry_count == 0, "1/3 不过半，不该整批重发"
+    assert engine.echo_item_count == 1
+    assert engine.echo_repaired_count == 1
+    assert engine.untranslated_count == 0
+    assert len(calls) == 2
+    assert calls[1] == ["world"], "只重译出问题的那一条"
 
 
-def test_auto_source_skips_echo_detection(monkeypatch):
-    # auto 判不出源语言，「回抄」也可能本来就该原样保留，不该打扰用户
+def test_partially_untranslated_batch_is_counted_not_fatal(monkeypatch):
+    """大部分翻好了、个别条目死活不翻：不该整批报错，但必须计数报出来。"""
     engine = make_engine()
+    reqs = [
+        TranslationRequest(text=t, source_lang="en", target_lang="zh-CN")
+        for t in ("hello", "world", "good morning", "OK")
+    ]
+
+    def fake_chat(messages, *, max_tokens=4096):
+        payload = user_payload(messages)
+        if len(payload) > 1:
+            return json.dumps(["你好", "世界", "早上好", "OK"], ensure_ascii=False)
+        return json.dumps(payload, ensure_ascii=False)  # 单条请求也原样退回
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    out = engine.translate_batch(reqs)
+
+    assert out == ["你好", "世界", "早上好", "OK"]
+    assert engine.echo_retry_count == 0, "只有 1/4 没翻，不到整批重发的门槛"
+    assert engine.echo_item_count == 1, "应该只挑出 'OK' 这一条去重译"
+    assert engine.echo_repaired_count == 0, "重译也没救回来"
+    assert engine.untranslated_count == 1, "没救回来的必须计数"
+    assert any("1 条疑似未翻译" in n for n in engine.quality_notes())
+
+
+def test_auto_source_still_catches_echo_by_reading_the_text(monkeypatch):
+    """源语言写 auto（界面默认值）时，整批回抄必须照样被抓到。
+
+    实测背景：auto + 20 条日文字幕，8 批里 2 批整批 100% 原样退回，
+    而旧的 should_check_echo 见到 auto 直接返回 False —— 全被静默交付。
+    """
+    engine = make_engine(echo_downgrade=False)
     src = ["hello", "world", "good morning"]
+
+    def fake_chat(messages, *, max_tokens=4096):
+        return json.dumps(src, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    reqs = [
+        TranslationRequest(text=t, source_lang="auto", target_lang="zh-CN")
+        for t in src
+    ]
+    with pytest.raises(TranslationError, match="完全相同"):
+        engine.translate_batch(reqs)
+    assert engine.echo_retry_count == 2, "auto 也要走完整的重发流程"
+
+
+def test_auto_source_with_matching_language_is_left_alone(monkeypatch):
+    """原文本来就是中文、目标也是中文：整批原样是正确结果，不能报错。"""
+    engine = make_engine()
+    src = ["我已经说过很多次了。", "那种事做不到。", "明白了吗？"]
 
     def fake_chat(messages, *, max_tokens=4096):
         return json.dumps(src, ensure_ascii=False)
@@ -463,6 +528,7 @@ def test_auto_source_skips_echo_detection(monkeypatch):
     ]
     assert engine.translate_batch(reqs) == src
     assert engine.echo_retry_count == 0
+    assert engine.echo_item_count == 0
 
 
 def test_same_language_pair_skips_echo_detection(monkeypatch):
@@ -491,9 +557,9 @@ def test_echo_retry_also_catches_echo_from_the_per_item_fallback(monkeypatch):
         calls.append(1)
         if len(calls) == 1:
             return "抱歉，我无法完成"      # 批量协议失败
-        return json.dumps([src[len(calls) - 2]])  # 逐条也只回抄
+        return json.dumps([src[(len(calls) - 2) % len(src)]])  # 逐条也只回抄
 
     monkeypatch.setattr(engine, "_chat", fake_chat)
     with pytest.raises(TranslationError, match="完全相同"):
         engine.translate_batch(bulk())
-    assert len(calls) == 4, "1 次批量失败 + 3 次逐条"
+    assert len(calls) >= 4, "1 次批量失败 + 至少 3 次逐条"

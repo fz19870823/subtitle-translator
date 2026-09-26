@@ -44,19 +44,140 @@ def _norm_lang(code: str) -> str:
     return (code or "").strip().lower().replace("_", "-")
 
 
-def should_check_echo(source_lang: str, target_lang: str) -> bool:
+#: 书写系统特征 → 归一化「族」名。**顺序即优先级**：
+#: 日语同时含汉字与假名，必须先认假名，否则会被判成汉字的族。
+_SCRIPT_FAMILIES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("ja", re.compile(r"[\u3040-\u309f\u30a0-\u30ff\uff66-\uff9d]")),   # 平/片假名
+    ("ko", re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]")),   # 谚文
+    ("cyrillic", re.compile(r"[\u0400-\u04ff\u0500-\u052f]")),
+    ("arabic", re.compile(r"[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff]")),
+    ("hebrew", re.compile(r"[\u0590-\u05ff]")),
+    ("devanagari", re.compile(r"[\u0900-\u097f]")),
+    ("thai", re.compile(r"[\u0e00-\u0e7f]")),
+    ("greek", re.compile(r"[\u0370-\u03ff\u1f00-\u1fff]")),
+    ("han", re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")),  # 汉字
+    ("latin", re.compile(r"[A-Za-z\u00c0-\u024f]")),
+)
+
+#: 语言主码 → 族。表里没有的语言以它自己的主码为族，于是与任何别的语言都不同 ——
+#: 拿不准时宁可判成「两门不同语言」，因为漏检的代价（交付未翻译的字幕）远大于误检。
+_PRIMARY_FAMILY: Dict[str, str] = {
+    "zh": "han", "cmn": "han", "yue": "han", "wuu": "han", "nan": "han", "hak": "han",
+    "ja": "ja", "jp": "ja",
+    "ko": "ko", "kr": "ko",
+    "ru": "cyrillic", "uk": "cyrillic", "be": "cyrillic", "bg": "cyrillic",
+    "sr": "cyrillic", "mk": "cyrillic", "kk": "cyrillic",
+    "ar": "arabic", "fa": "arabic", "ur": "arabic",
+    "he": "hebrew",
+    "hi": "devanagari", "bn": "devanagari", "mr": "devanagari", "ne": "devanagari",
+    "th": "thai",
+    "el": "greek",
+    "en": "latin", "de": "latin", "fr": "latin", "es": "latin", "pt": "latin",
+    "it": "latin", "nl": "latin", "id": "latin", "ms": "latin", "vi": "latin",
+    "tr": "latin", "pl": "latin", "cs": "latin", "sk": "latin", "sv": "latin",
+    "da": "latin", "nb": "latin", "no": "latin", "fi": "latin", "ro": "latin",
+    "hu": "latin", "hr": "latin", "sl": "latin", "lt": "latin", "lv": "latin",
+    "et": "latin", "tl": "latin", "sw": "latin", "af": "latin", "ca": "latin",
+    "gl": "latin", "eu": "latin", "is": "latin", "sq": "latin", "az": "latin",
+}
+
+_FAMILY_ORDER = [name for name, _ in _SCRIPT_FAMILIES]
+
+
+def _family_of(code: str) -> str | None:
+    """语言码 → 书写族；``auto`` / 空 / 认不出返回 None。"""
+    primary = _norm_lang(code).split("-")[0]
+    if not primary or primary == "auto":
+        return None
+    return _PRIMARY_FAMILY.get(primary, primary)
+
+
+def detect_script(text: str) -> str | None:
+    """从一段文本猜它的书写族（不看语言码）。
+
+    日语只要出现一个假名就归 ``ja`` —— 日语的助词、词尾几乎全是假名，
+    这个信号比汉字可靠得多（纯汉字的句子中日都有，判不出来）。
+    """
+    body = _TAG_RE.sub(" ", text)
+    for family, pattern in _SCRIPT_FAMILIES:
+        if pattern.search(body):
+            return family
+    return None
+
+
+def guess_text_family(samples: "Sequence[str]") -> str | None:
+    """整批文本的族：按条目投票取众数。
+
+    单条不可靠（一条纯汉字的日文句子会被认成汉字族），整批看多数就稳了。
+    """
+    counts: Dict[str, int] = {}
+    for text in samples:
+        if not is_translatable(text):
+            continue
+        family = detect_script(text)
+        if family:
+            counts[family] = counts.get(family, 0) + 1
+    if not counts:
+        return None
+    # 票数相同时按 _SCRIPT_FAMILIES 的先后定序，保证结果稳定可测。
+    return max(counts, key=lambda fam: (counts[fam], -_FAMILY_ORDER.index(fam)))
+
+
+def should_check_echo(
+    source_lang: str,
+    target_lang: str,
+    *,
+    samples: "Sequence[str]" = (),
+) -> bool:
     """是否对该批次做「原样回抄」检查。
 
-    只在能确定**是两门不同语言**时才检查，判不准就宁可漏检：
+    关键点：**源语言是 ``auto`` 不等于放弃检查**。界面默认就是 ``auto``，
+    若在这里直接返回 False，等于给最常见的使用方式关掉了唯一的防护
+    （实测：auto + 日文字幕，8 批里 2 批整批 20 条原样退回，全部静默交付）。
+    传了 ``samples`` 时就按文本的书写族去认源语言。
 
-    - 语言码为空或是 ``auto``：无从判断，误报会打断正常任务；
-    - 只是地区/字形变体（``en-GB`` 对 ``en-US``、``zh-CN`` 对 ``zh-TW``）：
-      这类转换里大量条目本来就该原样，回抄比例天然偏高，判定必然误报。
+    只有一种情况确定要放过：两边的族相同（``en-GB`` 对 ``en-US``、
+    ``zh-CN`` 对 ``zh-TW``）—— 这类转换里大量条目本来就该原样，
+    回抄比例天然偏高，判定必然误报。
     """
-    src, dst = _norm_lang(source_lang), _norm_lang(target_lang)
-    if not src or not dst or "auto" in (src, dst):
-        return False
-    return src.split("-")[0] != dst.split("-")[0]
+    dst_family = _family_of(target_lang)
+    if dst_family is None:
+        return False  # 目标语言都定不下来，无从判断
+
+    src_family = _family_of(source_lang)
+    if src_family is None:
+        src_family = guess_text_family(samples)
+        if src_family is None:
+            return False
+
+    return src_family != dst_family
+
+
+def locate_untranslated(
+    sources: "Sequence[str]",
+    outputs: "Sequence[str]",
+    target_lang: str,
+) -> List[int]:
+    """找出「一字未改、且据此可断定没翻」的条目下标。
+
+    单独一条与原文相同**不足以定罪** —— 日文「学校」译成中文仍是「学校」，
+    这类同形汉字词本来就该原样。真正能定罪的是：这条文本的书写族
+    压根不是目标语言的族（假名 vs 中文汉字、拉丁 vs 汉字），
+    那它一字未改就只可能是没翻。
+    """
+    dst_family = _family_of(target_lang)
+    if dst_family is None:
+        return []
+
+    hits: List[int] = []
+    for index, (source, output) in enumerate(zip(sources, outputs)):
+        if not is_translatable(source) or source.strip() != output.strip():
+            continue
+        family = detect_script(source)
+        if family is None or family == dst_family:
+            continue
+        hits.append(index)
+    return hits
 
 
 def looks_like_verbatim_echo(
@@ -75,7 +196,7 @@ def looks_like_verbatim_echo(
     单条相同是正常的（专有名词、缩写），因此只在可比条目够多时判定，
     且要求超过半数。
     """
-    if not should_check_echo(source_lang, target_lang):
+    if not should_check_echo(source_lang, target_lang, samples=sources):
         return False
 
     pairs = [(s, o) for s, o in zip(sources, outputs) if is_translatable(s)]
@@ -110,6 +231,36 @@ class Translator(abc.ABC):
 
     #: 是否需要外部 API 参数（地址/密钥/模型）。界面据此启用模型选择控件。
     requires_api = False
+
+    #: 质量相关的可观测统计。基类给出 0，引擎按需覆盖；
+    #: 界面可以无条件读取，不必知道具体是哪个引擎。
+    #: 因模型丢换行而被单独重译的条目数
+    line_repair_count = 0
+    #: 因整批原样回抄而重发的批次数
+    echo_retry_count = 0
+    #: 因残留未翻译条目而触发的逐条重译条数
+    echo_item_count = 0
+    #: 逐条重译救回来的条数
+    echo_repaired_count = 0
+    #: 用尽手段后仍未翻译的条数（> 0 表示译文不完整，必须让用户知道）
+    untranslated_count = 0
+
+    def quality_notes(self) -> List[str]:
+        """用一句话概括本次翻译的质量插曲，供界面提示。
+
+        回抄是**静默**故障：不报告就没人会发现手里那份字幕根本没翻。
+        所以宁可啰嗦，也要把「救了几条、还剩几条没救回来」摆到台面上。
+        """
+        notes: List[str] = []
+        if self.echo_retry_count:
+            notes.append(f"整批原样退回，重发 {self.echo_retry_count} 次")
+        if self.echo_repaired_count:
+            notes.append(f"逐条重译救回 {self.echo_repaired_count} 条")
+        if self.line_repair_count:
+            notes.append(f"换行丢失后按行重译 {self.line_repair_count} 条")
+        if self.untranslated_count:
+            notes.append(f"仍有 {self.untranslated_count} 条疑似未翻译")
+        return notes
 
     @abc.abstractmethod
     def translate_batch(self, requests: Sequence[TranslationRequest]) -> List[str]:

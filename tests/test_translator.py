@@ -11,7 +11,9 @@ from app.core.translator import (
     Translator,
     create_engine,
     create_engine_for,
+    detect_script,
     is_translatable,
+    locate_untranslated,
     looks_like_verbatim_echo,
     register,
     should_check_echo,
@@ -176,3 +178,61 @@ def test_echo_detection_ignores_untranslatable_lines():
     out = ["123", "---", "♪♪", "OK!", "hello"]
     # 可比条目只有 "OK!" "hello" 两条，达不到 min_items=3
     assert looks_like_verbatim_echo(src, out, "en", "zh-CN") is False
+
+
+# ------------------------------------------------------------------ auto 源语言
+#
+# 实测背景（2026-09-26）：界面默认源语言就是 auto，而旧的 should_check_echo
+# 见到 auto 直接返回 False。于是 grok-chat-fast + 日文字幕 8 批里那 2 批
+# 「整批 20 条原样退回」全被静默交付 —— 用户拿到一份没翻译的字幕却看不出异常。
+
+
+def test_should_check_echo_infers_source_from_text_when_auto():
+    """源语言是 auto 时必须靠文本把真实语言认出来，不能直接放弃检查。"""
+    ja = ["何度も言ったはずだ。", "そんなの無理だよ。", "分かった。任せるよ。"]
+    assert should_check_echo("auto", "zh-CN", samples=ja) is True
+    assert should_check_echo("auto", "zh-CN", samples=["hello", "world"]) is True
+
+    # 目标就是中文、原文也是中文：整批原样返回是**正确**行为，不能误报
+    zh = ["我已经说过很多次了。", "那种事做不到。"]
+    assert should_check_echo("auto", "zh-CN", samples=zh) is False
+    # 英文原文译英文：同理不该查
+    assert should_check_echo("auto", "en", samples=["hello", "world"]) is False
+
+    # 没给样本还是判不了 —— 退化成原来的保守行为
+    assert should_check_echo("auto", "zh-CN") is False
+
+
+def test_detect_script_picks_kana_before_han():
+    # 日语句子同时含汉字与假名，必须先认成日语，否则会被当成中文原文
+    assert detect_script("東京駅で待っている。") == "ja"
+    assert detect_script("何度も言ったはずだ。") == "ja"
+    assert detect_script("我已经说过很多次了。") == "han"
+    assert detect_script("hello world") == "latin"
+    assert detect_script("123 ---") is None
+
+
+def test_guess_text_family_survives_a_few_pure_kanji_lines():
+    """整批投票：夹着几条纯汉字的日文句子也不该把整批带偏。"""
+    from app.core.translator import guess_text_family
+
+    mixed = ["何度も言ったはずだ。", "東京駅", "そんなの無理だよ。", "学校"]
+    assert guess_text_family(mixed) == "ja"
+
+
+def test_locate_untranslated_spares_legitimately_identical_items():
+    """同形汉字词原样保留是合法的，只有"书写族根本不对"才能定罪。"""
+    src = ["何度も言ったはずだ。", "学校", "hello"]
+    out = list(src)
+    # 0 = 假名句没翻，1 = 「学校」对中文本就该原样（放过），2 = 英文没翻
+    assert locate_untranslated(src, out, "zh-CN") == [0, 2]
+
+    # 已经翻过的条目不参与
+    out2 = ["我已经说过很多次了。", "学校", "你好"]
+    assert locate_untranslated(src, out2, "zh-CN") == []
+
+
+def test_locate_untranslated_is_empty_when_target_unknown():
+    src = ["hello", "world"]
+    assert locate_untranslated(src, list(src), "auto") == []
+    assert locate_untranslated(src, list(src), "") == []

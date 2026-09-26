@@ -20,8 +20,11 @@ from app.core.translator import (
     TranslationError,
     TranslationRequest,
     Translator,
+    is_translatable,
+    locate_untranslated,
     looks_like_verbatim_echo,
     register,
+    should_check_echo,
 )
 
 # 从模型回复里抠出 JSON 数组：优先整段解析，失败再退回首个 [...] 片段。
@@ -127,6 +130,10 @@ class OpenAICompatTranslator(Translator):
     #: 且是间歇性的 —— 不重试就会静默交付一份没翻译的字幕。
     echo_retries = 2
 
+    #: 整批重发仍救不回来时，是否把没翻的条目拎出来逐条重译。
+    #: 单条请求更不容易被上游"整批偷懒"，实测能救回大部分残留。
+    echo_downgrade = True
+
     def __init__(
         self,
         *,
@@ -139,6 +146,7 @@ class OpenAICompatTranslator(Translator):
         batch_size: int = 20,
         preserve_line_breaks: bool = True,
         echo_retries: int | None = None,
+        echo_downgrade: bool | None = None,
     ) -> None:
         if not base_url:
             raise TranslationError("base_url 未配置")
@@ -159,11 +167,19 @@ class OpenAICompatTranslator(Translator):
         self.preserve_line_breaks = bool(preserve_line_breaks)
         if echo_retries is not None:
             self.echo_retries = max(0, int(echo_retries))
+        if echo_downgrade is not None:
+            self.echo_downgrade = bool(echo_downgrade)
         self._api_key = api_key  # 私有：不参与 repr，也不写进日志
         #: 因模型丢换行而被单独重译的条目数，便于观测提示词是否退化
         self.line_repair_count = 0
         #: 因整批原样回抄而重发的批次数
         self.echo_retry_count = 0
+        #: 因残留未翻译条目而触发的逐条重译条数
+        self.echo_item_count = 0
+        #: 逐条重译救回来的条数
+        self.echo_repaired_count = 0
+        #: 用尽所有手段后仍未翻译的条数（> 0 说明这批译文不完整）
+        self.untranslated_count = 0
 
     # 防止密钥经由 repr/日志外泄
     def __repr__(self) -> str:
@@ -329,22 +345,10 @@ class OpenAICompatTranslator(Translator):
 
         texts = [self._encode(t) for _, t in todo]
 
-        parsed: List[str] = []
-        for attempt in range(self.echo_retries + 1):
-            parsed = self._request_batch(
-                texts, source_lang, target_lang, strict=attempt > 0
-            )
-            if not looks_like_verbatim_echo(texts, parsed, source_lang, target_lang):
-                break
-            if attempt < self.echo_retries:
-                self.echo_retry_count += 1
-        else:
-            raise TranslationError(
-                f"连续 {self.echo_retries + 1} 次拿到的译文与原文完全相同，"
-                f"{source_lang} -> {target_lang} 未真正执行翻译。"
-                "这通常是上游把请求路由到了不支持跨语言翻译的通道，"
-                "稍后重试或换一个模型即可。"
-            )
+        parsed = self._request_batch(texts, source_lang, target_lang)
+        # 源语言写 auto 时按文本本身的书写族判断，别把最常见的用法漏在门外。
+        if should_check_echo(source_lang, target_lang, samples=texts):
+            parsed = self._recover_echoes(texts, parsed, source_lang, target_lang)
 
         for (index, original), translation in zip(todo, parsed):
             fixed = self._decode(translation)
@@ -356,6 +360,52 @@ class OpenAICompatTranslator(Translator):
                     fixed = repaired
             results[index] = fixed
         return results
+
+    def _recover_echoes(
+        self,
+        texts: Sequence[str],
+        parsed: List[str],
+        source_lang: str,
+        target_lang: str,
+    ) -> List[str]:
+        """把「没翻译」压到最少，全都压不下去才报错。
+
+        三级处置，代价由小到大：
+
+        1. 整批被原样退回 —— 换成把要求说死的提示词整批重发（最多 ``echo_retries`` 次）；
+        2. 重发后仍有零星条目一字未改 —— 只把这几个拎出来单独重译，比其他条目贵不了多少；
+        3. 单条重译仍纹丝不动 —— 计入 ``untranslated_count``；若整批可比条目**无一**
+           翻出来，说明这条通道是真不干活，直接报错，绝不把没翻译的字幕当成品交出去。
+        """
+        for _ in range(self.echo_retries):
+            if not looks_like_verbatim_echo(texts, parsed, source_lang, target_lang):
+                break
+            self.echo_retry_count += 1
+            parsed = self._request_batch(texts, source_lang, target_lang, strict=True)
+
+        leftover = locate_untranslated(texts, parsed, target_lang)
+        if leftover and self.echo_downgrade:
+            self.echo_item_count += len(leftover)
+            for index in leftover:
+                retried = self._translate_one(
+                    texts[index], source_lang, target_lang, strict=True
+                )
+                if retried.strip() != texts[index].strip():
+                    parsed[index] = retried
+                    self.echo_repaired_count += 1
+
+        remaining = locate_untranslated(texts, parsed, target_lang)
+        if remaining:
+            self.untranslated_count += len(remaining)
+            comparable = sum(1 for text in texts if is_translatable(text))
+            if comparable and len(remaining) >= comparable:
+                raise TranslationError(
+                    f"连续 {self.echo_retries + 1} 次拿到的译文与原文完全相同，"
+                    f"{source_lang} -> {target_lang} 未真正执行翻译。"
+                    "这通常是上游把请求路由到了不支持跨语言翻译的通道，"
+                    "稍后重试或换一个模型即可。"
+                )
+        return parsed
 
     def _request_batch(
         self,
@@ -384,7 +434,10 @@ class OpenAICompatTranslator(Translator):
         parsed = self._parse_array(content, len(texts))
         if parsed is None:
             # 批量协议被破坏（模型加了解释/数量不符）时退回逐条，宁可慢也不丢内容。
-            parsed = [self._translate_one(t, source_lang, target_lang) for t in texts]
+            parsed = [
+                self._translate_one(t, source_lang, target_lang, strict=strict)
+                for t in texts
+            ]
         return parsed
 
     def _translate_lines(
@@ -410,23 +463,43 @@ class OpenAICompatTranslator(Translator):
 
         rebuilt = list(lines)
         for index, translation in zip(keep, parsed):
-            rebuilt[index] = translation.strip()
+            rebuilt[index] = self._decode(translation)
         return "\n".join(rebuilt)
 
-    def _translate_one(self, text: str, source_lang: str, target_lang: str) -> str:
+    def _translate_one(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        *,
+        strict: bool = False,
+    ) -> str:
+        """单条翻译。
+
+        ``text`` 与返回值都保持「线上形式」（换行仍是 ⏎ 记号），
+        由 ``translate_batch`` 统一做编解码 —— 这样批量路径与逐条路径
+        产出的结果在同一个坐标系里，回抄判定才能直接比较。
+        """
         content = self._chat(
             [
-                {"role": "system", "content": self._system_prompt(target_lang)},
-                {"role": "user", "content": json.dumps([self._encode(text)], ensure_ascii=False)},
+                {
+                    "role": "system",
+                    "content": self._system_prompt(target_lang, strict=strict),
+                },
+                {"role": "user", "content": json.dumps([text], ensure_ascii=False)},
             ],
             max_tokens=1024,
         )
         parsed = self._parse_array(content, 1)
         if parsed is not None:
-            return self._decode(parsed[0])
+            return parsed[0]
         # 单条也解析不出就退到纯文本：去掉可能的代码围栏与首尾引号。
         cleaned = _FENCE_RE.sub("", content.strip()).strip().strip('"').strip()
-        return self._decode(cleaned) or text
+        if not cleaned or cleaned[0] in "[{":
+            # 解析不出来的结构体绝不能当译文 —— 上层会把它认成"翻好了"，
+            # 于是垃圾内容被静默塞进字幕。宁可原样交回，让上层判为"没翻"。
+            return text
+        return cleaned
 
 
 def build_from_config(cfg: TranslationConfig) -> OpenAICompatTranslator:
