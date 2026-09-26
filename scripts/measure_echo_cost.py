@@ -192,6 +192,12 @@ def main() -> int:
         f"累计：整批重发 {engine.echo_retry_count} 次，逐条条目 {engine.echo_item_count} 条 / "
         f"实际请求 {engine.echo_item_attempts} 次，救回 {engine.echo_repaired_count} 条"
     )
+    lines.append(
+        f"链路重试 {engine.http_retry_count} 次（{engine.http_retry_reasons}），"
+        f"额外等待 {engine.http_retry_waited:.1f}s —— "
+        "注意「请求数」列数的是逻辑请求（_post 调用次数），"
+        "链路重发发生在 _post 内部，不在此列。"
+    )
     flush()
     print(f"written: {out}")
     return 0

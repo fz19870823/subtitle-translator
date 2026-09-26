@@ -8,12 +8,14 @@ OpenAI、各类中转/聚合网关（含 grok2api 这类自建中继）、以及
 from __future__ import annotations
 
 import json
+import random
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Callable, Dict, List, Sequence
 
 from app.config import TranslationConfig
 from app.core.translator import (
@@ -82,7 +84,116 @@ def extract_model_ids(payload: Any) -> List[str]:
     return ids
 
 
-def fetch_models(base_url: str, api_key: str, *, timeout: int = 30) -> List[str]:
+# ------------------------------------------------------------------ 链路重试
+#
+# 中继链路上的 502/503/504 是**瞬时**故障：上游节点被踢下线、后端池在扩容重启、
+# 网关健康检查把某台摘掉 —— 同一份请求过一两秒再发往往就成功了。它和
+# 「模型翻不动」（见 ``_recover_echoes``）是两回事，但后果一样：一批字幕直接
+# 卡死、整个任务中断。所以同样要自动重试。
+
+#: 重发有意义的状态码。
+#:
+#: 4xx 里的 400/401/403/404/422 是**确定性**失败（密钥错、模型名错、参数非法），
+#: 重发一百次也是同样的结果，只会白烧配额 —— 刻意不在这一列里。
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+#: 第一次失败后大约等这么久，之后逐次翻倍（实际会带抖动，见 ``_backoff``）。
+_RETRY_BASE_DELAY = 0.6
+#: 单次等待上限，别让一个坏掉的网关卡住整段字幕。
+_RETRY_MAX_DELAY = 8.0
+#: 服务端 ``Retry-After`` 的封顶值。
+_RETRY_MAX_WAIT = 30.0
+
+#: 等待由它执行 —— 抽成模块级变量，测试里替换掉就不必真的干等。
+_SLEEP = time.sleep
+
+
+def _backoff(attempt: int) -> float:
+    """指数退避 + 抖动。
+
+    抖动是给「服务端刚恢复、所有客户端同时重试」留的余量：固定等待会让
+    它们齐步冲上去，把刚起来的节点再打挂一次。取 ``[base/2, base]`` 而不是
+    ``[0, base]``，是为了保证至少等了一半，别把重试退化成紧凑轮询。
+    """
+    base = min(_RETRY_BASE_DELAY * (2 ** max(0, attempt)), _RETRY_MAX_DELAY)
+    return base / 2 + random.uniform(0, base / 2)
+
+
+def _is_cert_error(exc: BaseException) -> bool:
+    """证书校验 / 主机名不匹配 —— 确定性失败，重发无用。"""
+    candidates = (exc, getattr(exc, "reason", None))
+    return any(isinstance(item, ssl.SSLCertVerificationError) for item in candidates)
+
+
+def _retry_after(exc: urllib.error.HTTPError) -> float | None:
+    """服务端显式要求的等待秒数；只认纯数字形式的 ``Retry-After``。"""
+    headers = getattr(exc, "headers", None)
+    raw = headers.get("Retry-After") if headers else None
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except ValueError:
+        # HTTP-date 形式的 Retry-After 这里不解析：中继基本只用秒数，
+        # 解析日期还得把系统时钟的偏差一起背进来。
+        return None
+
+
+def _retry_delay(exc: BaseException, attempt: int) -> float | None:
+    """这次失败要不要重发、等多久；返回 None 表示「重发也没用」。
+
+    注：``urllib.error.HTTPError`` 是 ``URLError`` 的子类，``URLError`` 又是
+    ``OSError`` 的子类，所以判断顺序必须是「从具体到笼统」。
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code not in RETRYABLE_STATUS:
+            return None
+        explicit = _retry_after(exc)
+        # 服务端说了等多久就照办（封顶，免得被一个离谱的值卡死）。
+        return min(explicit, _RETRY_MAX_WAIT) if explicit is not None else _backoff(attempt)
+    if _is_cert_error(exc):
+        return None
+    if isinstance(exc, OSError):
+        # 连接被重置、握手失败、DNS 抖动、读超时 —— 都可能下一秒就好了。
+        return _backoff(attempt)
+    return None
+
+
+def _open_with_retry(
+    req: urllib.request.Request,
+    *,
+    timeout: int,
+    retries: int,
+    on_retry: Callable[[int, BaseException, float], None] | None = None,
+) -> str:
+    """发一个已构造好的请求，对链路临时故障自动重发，返回解码后的响应体。
+
+    重试用尽或遇到确定性错误时**原样抛出最后一次的异常**，由调用方按各自场景
+    包装成 :class:`TranslationError` —— 「拉取模型列表失败」和「翻译请求失败」
+    的措辞不一样，不该在这里写死。
+
+    ``on_retry(第几次重试, 异常, 等待秒数)`` 每次重发前回调，供调用方记账。
+    """
+    retries = max(0, int(retries))
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(
+                req, timeout=int(timeout), context=ssl.create_default_context()
+            ) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except OSError as exc:
+            delay = _retry_delay(exc, attempt)
+            if delay is None or attempt >= retries:
+                raise
+            if on_retry is not None:
+                on_retry(attempt + 1, exc, delay)
+            _SLEEP(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def fetch_models(
+    base_url: str, api_key: str, *, timeout: int = 30, retries: int = 2
+) -> List[str]:
     """``GET {base_url}/models``，返回模型 id 列表。
 
     独立成函数（而不是 translator 的方法），这样界面在用户还没选定模型时
@@ -96,10 +207,7 @@ def fetch_models(base_url: str, api_key: str, *, timeout: int = 30) -> List[str]
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "subtitle-translator/0.1")
     try:
-        with urllib.request.urlopen(
-            req, timeout=int(timeout), context=ssl.create_default_context()
-        ) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+        raw = _open_with_retry(req, timeout=int(timeout), retries=retries)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:400]
         raise TranslationError(
@@ -109,6 +217,8 @@ def fetch_models(base_url: str, api_key: str, *, timeout: int = 30) -> List[str]
         raise TranslationError(f"连接 {url} 失败: {exc.reason}") from None
     except TimeoutError:
         raise TranslationError(f"拉取模型列表超时（{timeout}s）") from None
+    except OSError as exc:
+        raise TranslationError(f"连接 {url} 失败: {exc}") from None
 
     try:
         payload = json.loads(raw)
@@ -145,6 +255,15 @@ class OpenAICompatTranslator(Translator):
     #: 试两次把单条残留率从 1/3 压到 1/9。只对已判定失败的条目发请求，代价极小。
     echo_item_retries = 2
 
+    #: 链路临时故障（502/503/504、429 限流、连接抖动）的自动重发次数。
+    #:
+    #: 取值说明：与 ``echo_retries`` 不同，这个数**不是**从实测失败率推出来的 ——
+    #: 502 无法按需复现（见 ``scripts/verify_http_retry.py --live`` 对真实中继的
+    #: 采样），用的是常规默认。首次失败等 0.3–0.6s，之后逐次翻倍，3 次重试
+    #: 总共最多多等约 3s：足够跨过「上游节点被摘掉、几秒后重新挂上」这类抖动，
+    #: 又不会在网关真挂了的时候把整段任务拖住（那时早报错比干等有用）。
+    http_retries = 3
+
     def __init__(
         self,
         *,
@@ -159,6 +278,7 @@ class OpenAICompatTranslator(Translator):
         echo_retries: int | None = None,
         echo_downgrade: bool | None = None,
         echo_item_retries: int | None = None,
+        http_retries: int | None = None,
     ) -> None:
         if not base_url:
             raise TranslationError("base_url 未配置")
@@ -183,6 +303,8 @@ class OpenAICompatTranslator(Translator):
             self.echo_downgrade = bool(echo_downgrade)
         if echo_item_retries is not None:
             self.echo_item_retries = max(0, int(echo_item_retries))
+        if http_retries is not None:
+            self.http_retries = max(0, int(http_retries))
         self._api_key = api_key  # 私有：不参与 repr，也不写进日志
         #: 因模型丢换行而被单独重译的条目数，便于观测提示词是否退化
         self.line_repair_count = 0
@@ -196,6 +318,12 @@ class OpenAICompatTranslator(Translator):
         self.echo_repaired_count = 0
         #: 用尽所有手段后仍未翻译的条数（> 0 说明这批译文不完整）
         self.untranslated_count = 0
+        #: 因链路临时故障（502/503/504、限流、连接抖动）自动重发的**请求次数**
+        self.http_retry_count = 0
+        #: 重发原因分布，如 ``{"HTTP 502": 2}`` —— 界面据此说清"到底怎么了"
+        self.http_retry_reasons: Dict[str, int] = {}
+        #: 重发前累计等待的秒数，用于判断中继是不是在持续抖动
+        self.http_retry_waited = 0.0
 
     # 防止密钥经由 repr/日志外泄
     def __repr__(self) -> str:
@@ -225,7 +353,31 @@ class OpenAICompatTranslator(Translator):
         )
 
     # ------------------------------------------------------------------ HTTP
+    def _note_http_retry(self, attempt: int, exc: BaseException, delay: float) -> None:
+        """记一次链路重试：谁、为什么、等了多久。"""
+        self.http_retry_count += 1
+        self.http_retry_waited += delay
+        if isinstance(exc, urllib.error.HTTPError):
+            reason = f"HTTP {exc.code}"
+        elif isinstance(exc, TimeoutError):
+            reason = "响应超时"
+        else:
+            reason = "连接中断"
+        self.http_retry_reasons[reason] = self.http_retry_reasons.get(reason, 0) + 1
+
+    def _retry_hint(self, retryable: bool) -> str:
+        """给错误信息补一句「已经重试过 N 次了」，免得用户以为是偶发失败。"""
+        if not retryable or not self.http_retries:
+            return ""
+        return f"（已自动重试 {self.http_retries} 次）"
+
     def _post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """POST 并解析 JSON 响应；链路临时故障（502/503/504…）自动重发。
+
+        重试与「回抄重试」是两件事：这里处理的是**请求根本没被正常处理**
+        （网关 502、限流 429、连接被重置），重发同一份请求就是正确做法；
+        回抄则是请求被处理了但没翻译，得换提示词（见 ``_recover_echoes``）。
+        """
         url = f"{self.base_url}{path}"
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=data, method="POST")
@@ -235,19 +387,28 @@ class OpenAICompatTranslator(Translator):
         req.add_header("User-Agent", "subtitle-translator/0.1")
 
         try:
-            with urllib.request.urlopen(
-                req, timeout=self.timeout, context=ssl.create_default_context()
-            ) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
+            raw = _open_with_retry(
+                req,
+                timeout=self.timeout,
+                retries=self.http_retries,
+                on_retry=self._note_http_retry,
+            )
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:400]
+            hint = self._retry_hint(exc.code in RETRYABLE_STATUS)
             raise TranslationError(
-                f"HTTP {exc.code} from {url} —— {explain_http_error(detail)}"
+                f"HTTP {exc.code} from {url} —— {explain_http_error(detail)}{hint}"
             ) from None
         except urllib.error.URLError as exc:
-            raise TranslationError(f"连接 {url} 失败: {exc.reason}") from None
+            raise TranslationError(
+                f"连接 {url} 失败: {exc.reason}{self._retry_hint(not _is_cert_error(exc))}"
+            ) from None
         except TimeoutError:
-            raise TranslationError(f"请求 {url} 超时（{self.timeout}s）") from None
+            raise TranslationError(
+                f"请求 {url} 超时（{self.timeout}s）{self._retry_hint(True)}"
+            ) from None
+        except OSError as exc:
+            raise TranslationError(f"连接 {url} 失败: {exc}{self._retry_hint(True)}") from None
 
         try:
             payload = json.loads(raw)
@@ -394,10 +555,12 @@ class OpenAICompatTranslator(Translator):
         3. 单条重译仍纹丝不动 —— 计入 ``untranslated_count``；若整批可比条目**无一**
            翻出来，说明这条通道是真不干活，直接报错，绝不把没翻译的字幕当成品交出去。
         """
+        attempts = 1  # 已经发过的那一次
         for _ in range(self.echo_retries):
             if not looks_like_verbatim_echo(texts, parsed, source_lang, target_lang):
                 break
             self.echo_retry_count += 1
+            attempts += 1
             parsed = self._request_batch(texts, source_lang, target_lang, strict=True)
 
         leftover = locate_untranslated(texts, parsed, target_lang)
@@ -425,9 +588,12 @@ class OpenAICompatTranslator(Translator):
             self.untranslated_count += len(remaining)
             comparable = sum(1 for text in texts if is_translatable(text))
             if comparable and len(remaining) >= comparable:
+                # 报**实际**发过几次，不是重试预算。
+                # 单条批次走不到整批判定（min_items=3），这里只有 1 次 ——
+                # 旧文案写死 echo_retries + 1，会谎报「连续 4 次」，误导定位。
                 raise TranslationError(
-                    f"连续 {self.echo_retries + 1} 次拿到的译文与原文完全相同，"
-                    f"{source_lang} -> {target_lang} 未真正执行翻译。"
+                    f"请求 {attempts} 次，{source_lang} -> {target_lang} 的译文"
+                    "始终与原文完全相同，未真正执行翻译。"
                     "这通常是上游把请求路由到了不支持跨语言翻译的通道，"
                     "稍后重试或换一个模型即可。"
                 )

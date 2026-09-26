@@ -254,12 +254,18 @@ class Translator(abc.ABC):
     echo_repaired_count = 0
     #: 用尽手段后仍未翻译的条数（> 0 表示译文不完整，必须让用户知道）
     untranslated_count = 0
+    #: 因链路临时故障（502/503/504、限流、连接抖动）自动重发的请求次数
+    http_retry_count = 0
+    #: 重发原因分布，如 ``{"HTTP 502": 2}``
+    http_retry_reasons: Dict[str, int] = {}
 
     def quality_notes(self) -> List[str]:
         """用一句话概括本次翻译的质量插曲，供界面提示。
 
         回抄是**静默**故障：不报告就没人会发现手里那份字幕根本没翻。
         所以宁可啰嗦，也要把「救了几条、还剩几条没救回来」摆到台面上。
+        链路重试虽然最终成功了，也值得说一声 —— 中继在持续抖动时，
+        用户据此能判断「今天这档状态要不要等会儿再跑」。
         """
         notes: List[str] = []
         if self.echo_retry_count:
@@ -268,6 +274,12 @@ class Translator(abc.ABC):
             notes.append(f"逐条重译救回 {self.echo_repaired_count} 条")
         if self.line_repair_count:
             notes.append(f"换行丢失后按行重译 {self.line_repair_count} 条")
+        if self.http_retry_count:
+            detail = ""
+            reasons = getattr(self, "http_retry_reasons", None)
+            if reasons:
+                detail = "（" + "、".join(f"{k}×{v}" for k, v in reasons.items()) + "）"
+            notes.append(f"链路临时故障自动重试 {self.http_retry_count} 次{detail}")
         if self.untranslated_count:
             notes.append(f"仍有 {self.untranslated_count} 条疑似未翻译")
         return notes

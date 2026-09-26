@@ -1,18 +1,23 @@
-"""OpenAI 兼容后端的离线测试：协议解析、换行处理、失败回退。
+"""OpenAI 兼容后端的离线测试：协议解析、换行处理、失败回退、链路重试。
 
-全部通过桩掉 ``_chat`` 完成，不发起任何网络请求。
+翻译协议部分通过桩掉 ``_chat`` 完成；HTTP 层（状态码、退避、Retry-After）
+桩掉 ``urllib.request.urlopen`` —— 都不发起真实网络请求。
 """
 from __future__ import annotations
 
 import io
 import json
+import ssl
 import urllib.error
+from email.message import Message
 
 import pytest
 
 from app.config import ConfigError, TranslationConfig
+from app.core.engines import openai_compat
 from app.core.engines.openai_compat import (
     _LINE_MARK,
+    _RETRY_MAX_WAIT,
     OpenAICompatTranslator,
     extract_model_ids,
     fetch_models,
@@ -352,6 +357,8 @@ def test_fetch_models_surfaces_http_error(monkeypatch):
 
 
 def test_fetch_models_surfaces_connection_error(monkeypatch):
+    monkeypatch.setattr(openai_compat, "_SLEEP", lambda _s: None)  # 重试会退避，别真等
+
     def fake_urlopen(req, timeout=None, context=None):
         raise urllib.error.URLError("dns failure")
 
@@ -421,6 +428,50 @@ def test_exhausted_echo_retries_raise_instead_of_shipping_garbage(monkeypatch):
 
     assert "完全相同" in str(info.value)
     assert engine.echo_retry_count == 1, "echo_retries=1 表示只重发一次"
+
+
+def test_error_message_reports_actual_attempts_not_the_retry_budget(monkeypatch):
+    """报真实的请求次数，不是重试预算。
+
+    单条批次达不到整批判定的门槛（min_items=3），一次都不会重发 ——
+    旧文案写死 `echo_retries + 1`，会谎报「连续 4 次」，把定位带偏
+    （本轮就是这么被它绕过一圈的）。
+    """
+    engine = make_engine(echo_downgrade=False)
+    calls: list[int] = []
+
+    def fake_chat(messages, *, max_tokens=4096):
+        calls.append(1)
+        return json.dumps(["何度も言ったはずだ。"], ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    reqs = [
+        TranslationRequest(
+            text="何度も言ったはずだ。", source_lang="ja", target_lang="zh-CN"
+        )
+    ]
+    with pytest.raises(TranslationError) as info:
+        engine.translate_batch(reqs)
+
+    assert len(calls) == 1, "条目不足 3 条时不做整批重发"
+    assert "请求 1 次" in str(info.value)
+    assert "4 次" not in str(info.value), "不能把预算当成实际次数报出去"
+
+
+def test_error_message_counts_the_real_retries_for_a_full_batch(monkeypatch):
+    """整批都在回抄时，报的应该是「1 次 + 3 次重发 = 4 次」。"""
+    engine = make_engine(echo_downgrade=False)  # echo_retries 默认 3
+    src = ["hello", "world", "good morning"]
+
+    def fake_chat(messages, *, max_tokens=4096):
+        return json.dumps(src, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_chat", fake_chat)
+    with pytest.raises(TranslationError) as info:
+        engine.translate_batch(bulk())
+
+    assert engine.echo_retry_count == engine.echo_retries
+    assert f"请求 {engine.echo_retries + 1} 次" in str(info.value)
 
 
 def test_echo_retries_zero_means_no_batch_resend(monkeypatch):
@@ -597,3 +648,228 @@ def test_echo_retry_also_catches_echo_from_the_per_item_fallback(monkeypatch):
     with pytest.raises(TranslationError, match="完全相同"):
         engine.translate_batch(bulk())
     assert len(calls) >= 4, "1 次批量失败 + 至少 3 次逐条"
+
+
+# ------------------------------------------------------------------ 链路临时故障重试
+#
+# 中继链路会给出 502/503/504（上游节点被摘掉、后端池在重启）和 429（限流）。
+# 这类失败重发同一份请求就是正确做法，但有两件事绝不能做错：
+# ① 401/400 这种确定性失败**一次都不能重试** —— 只会白烧配额；
+# ② 重试用尽后必须报错，不能悄悄少翻一批。
+#
+# 真实网络下的端到端验证见 ``scripts/verify_http_retry.py``（本地起 HTTP 服务
+# 真的返回 502，比桩更可信）。
+
+
+def _no_sleep(monkeypatch) -> list[float]:
+    """替换退避等待并记录每段时长 —— 否则测试要真等好几秒。"""
+    slept: list[float] = []
+    monkeypatch.setattr(openai_compat, "_SLEEP", slept.append)
+    return slept
+
+
+def _ok_response(texts: list[str]) -> _FakeResponse:
+    """一次成功的 chat/completions 响应，content 是译文数组的 JSON。"""
+    body = {
+        "choices": [{"message": {"content": json.dumps(texts, ensure_ascii=False)}}]
+    }
+    return _FakeResponse(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+
+
+def _http_error(
+    code: int,
+    *,
+    url: str = "https://example.invalid/v1/chat/completions",
+    body: dict | None = None,
+    retry_after: str | None = None,
+) -> urllib.error.HTTPError:
+    payload = body or {"error": {"code": "bad_gateway", "message": "upstream down"}}
+    headers = Message()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return urllib.error.HTTPError(
+        url, code, "error", headers, io.BytesIO(json.dumps(payload).encode("utf-8"))
+    )
+
+
+def test_502_is_retried_and_then_succeeds(monkeypatch):
+    """这是用户报的场景：中继偶发 502，重发一次就好了。"""
+    slept = _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None, context=None):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise _http_error(502)
+        return _ok_response(["你好", "世界"])
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    engine = make_engine()
+    out = engine.translate_batch([req("hello"), req("world")])
+
+    assert out == ["你好", "世界"]
+    assert calls["n"] == 3, "2 次 502 + 1 次成功"
+    assert engine.http_retry_count == 2
+    assert engine.http_retry_reasons == {"HTTP 502": 2}
+    assert len(slept) == 2
+    assert slept[0] <= slept[1], "退避必须一次比一次长，否则就是紧凑轮询"
+
+
+def test_definitive_failures_are_not_retried(monkeypatch):
+    """401/400 是确定性失败：密钥错重发一百次还是密钥错，只会白烧配额。"""
+    for code in (400, 401, 403, 404, 422):
+        slept: list[float] = []
+        monkeypatch.setattr(openai_compat, "_SLEEP", slept.append)
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None, context=None, _code=code):
+            calls["n"] += 1
+            raise _http_error(
+                _code, body={"error": {"code": "invalid_api_key", "message": "bad key"}}
+            )
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        engine = make_engine()
+
+        with pytest.raises(TranslationError) as info:
+            engine.translate_batch([req("hello")])
+
+        assert calls["n"] == 1, f"HTTP {code} 不该被重试"
+        assert slept == []
+        assert engine.http_retry_count == 0
+        assert str(code) in str(info.value)
+        assert "已自动重试" not in str(info.value), "没重试就不能声称重试过"
+
+
+def test_exhausted_retries_report_the_status_and_the_attempt_count(monkeypatch):
+    """重试用尽后必须报错，而不是少翻一批就往下走。"""
+    _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None, context=None):
+        calls["n"] += 1
+        raise _http_error(502)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    engine = make_engine(http_retries=2)
+
+    with pytest.raises(TranslationError) as info:
+        engine.translate_batch([req("hello")])
+
+    assert calls["n"] == 3, "1 次原始 + 2 次重试"
+    assert engine.http_retry_count == 2
+    message = str(info.value)
+    assert "502" in message
+    assert "已自动重试 2 次" in message, "要让用户知道不是偶发一次失败"
+
+
+def test_503_504_429_500_are_all_retryable():
+    from app.core.engines.openai_compat import RETRYABLE_STATUS
+
+    assert {429, 500, 502, 503, 504} <= RETRYABLE_STATUS
+
+
+def test_retry_after_header_is_honoured(monkeypatch):
+    """服务端说了等多久就等多久，别自作聪明。"""
+    slept = _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None, context=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _http_error(503, retry_after="2")
+        return _ok_response(["你好"])
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert make_engine().translate_batch([req("hello")]) == ["你好"]
+    assert slept == [2.0]
+
+
+def test_absurd_retry_after_is_capped(monkeypatch):
+    """中继要是回一个离谱的 Retry-After，不能真照等 —— 那等于挂死。"""
+    slept = _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None, context=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _http_error(503, retry_after="3600")
+        return _ok_response(["你好"])
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert make_engine().translate_batch([req("hello")]) == ["你好"]
+    assert slept == [_RETRY_MAX_WAIT]
+
+
+def test_connection_reset_is_retried(monkeypatch):
+    """连接被重置同样是瞬时故障 —— 下一秒重发往往就通了。"""
+    _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None, context=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise urllib.error.URLError(ConnectionResetError("connection reset by peer"))
+        return _ok_response(["你好"])
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    engine = make_engine()
+    assert engine.translate_batch([req("hello")]) == ["你好"]
+    assert engine.http_retry_reasons == {"连接中断": 1}
+
+
+def test_certificate_error_is_not_retried(monkeypatch):
+    """证书校验不过重发也没用，别拿它浪费重试次数和用户时间。"""
+    slept = _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None, context=None):
+        calls["n"] += 1
+        raise urllib.error.URLError(
+            ssl.SSLCertVerificationError(1, "certificate verify failed")
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    engine = make_engine()
+
+    with pytest.raises(TranslationError):
+        engine.translate_batch([req("hello")])
+    assert calls["n"] == 1
+    assert slept == []
+    assert engine.http_retry_count == 0
+
+
+def test_fetch_models_also_retries_on_502(monkeypatch):
+    """拉模型列表走的也是同一个中继，502 同样要能扛过去。"""
+    slept = _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None, context=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _http_error(502, url=req.full_url)
+        return _FakeResponse(
+            json.dumps({"data": [{"id": "grok-a"}]}).encode("utf-8")
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert fetch_models("https://x.invalid/v1", "k") == ["grok-a"]
+    assert calls["n"] == 2
+    assert len(slept) == 1
+
+
+def test_quality_notes_mention_link_retries():
+    """重试最终成功了，也该在状态栏说一声 —— 中继在持续抖动时用户要能看出来。"""
+    engine = make_engine()
+    engine.http_retry_count = 2
+    engine.http_retry_reasons = {"HTTP 502": 2}
+
+    note = next(n for n in engine.quality_notes() if "重试" in n)
+    assert "2 次" in note
+    assert "HTTP 502×2" in note
+
+
+def test_http_retries_default_is_sane():
+    assert OpenAICompatTranslator.http_retries >= 2, "只重试一次扛不住连续抖动"
+    assert make_engine(http_retries=0).http_retries == 0, "要能显式关掉"
+    assert make_engine(http_retries=-5).http_retries == 0, "负数按 0 处理"
