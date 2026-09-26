@@ -378,3 +378,26 @@ def test_locate_untranslated_is_empty_when_target_unknown():
     src = ["hello", "world"]
     assert locate_untranslated(src, list(src), "auto") == []
     assert locate_untranslated(src, list(src), "") == []
+
+
+# ------------------------------------------------------------------ 质量插曲
+
+
+def test_quality_notes_can_skip_the_untranslated_line():
+    """界面自己会从字幕里再数一遍未翻译条数，引擎不该再报一个数。
+
+    两边都报会变成状态栏里「仍有 3 条未翻译　|　仍有 3 条疑似未翻译」，
+    而且引擎只知道这一跑里撞上几条、界面知道整份还剩几条 —— 两个数还可能不一样。
+    """
+
+    class Noisy(Translator):
+        name = "noisy"
+        untranslated_count = 3
+
+        def translate_batch(self, requests):
+            return [r.text for r in requests]
+
+    engine = Noisy()
+    assert any("3 条疑似未翻译" in note for note in engine.quality_notes())
+    notes = engine.quality_notes(include_untranslated=False)
+    assert not any("疑似未翻译" in note for note in notes)

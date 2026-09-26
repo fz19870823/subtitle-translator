@@ -47,6 +47,7 @@ class TranslateWorker(QThread):
         *,
         source_lang: str,
         target_lang: str,
+        batch_size: int | None = None,
         writer: CheckpointWriter | None = None,
         skip_translated: bool = False,
         parent=None,
@@ -58,6 +59,9 @@ class TranslateWorker(QThread):
         self._cues = list(cues)
         self._source_lang = source_lang
         self._target_lang = target_lang
+        #: 界面上的「上下文窗口」。显式传给引擎，而不是靠在引擎上设属性：
+        #: 引擎的 batch_size 是构造时从配置读的，界面改一个数字不该牵扯到重建引擎。
+        self._batch_size = None if batch_size is None else int(batch_size)
         self._writer = writer
         self._skip_translated = bool(skip_translated)
         self._stop = Event()
@@ -117,6 +121,7 @@ class TranslateWorker(QThread):
                 self._cues,
                 source_lang=self._source_lang,
                 target_lang=self._target_lang,
+                batch_size=self._batch_size,
                 progress=self._emit_progress,
                 should_stop=self._stop.is_set,
                 skip_translated=self._skip_translated,

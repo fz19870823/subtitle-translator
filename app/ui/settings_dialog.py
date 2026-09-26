@@ -77,7 +77,11 @@ class SettingsDialog(QDialog):
 
         self.batch_spin = QSpinBox()
         self.batch_spin.setRange(1, 200)
-        self.batch_spin.setToolTip("单次请求携带多少条字幕")
+        self.batch_spin.setSuffix(" 条/次")
+        self.batch_spin.setToolTip(
+            "单次请求携带多少条字幕（主界面上的「上下文窗口」就是这个值）。\n"
+            "主界面改的是本次；这里保存的是下次启动时的默认值。"
+        )
 
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(5, 600)
@@ -99,7 +103,7 @@ class SettingsDialog(QDialog):
         form.addRow("明文密钥", self.key_edit)
         form.addRow("生效密钥", self.key_origin_label)
         form.addRow("模型", self.model_selector)
-        form.addRow("批量大小", self.batch_spin)
+        form.addRow("上下文窗口", self.batch_spin)
         form.addRow("超时", self.timeout_spin)
         form.addRow("温度", self.temperature_spin)
         form.addRow("", self.preserve_check)
