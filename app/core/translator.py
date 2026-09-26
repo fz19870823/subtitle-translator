@@ -297,6 +297,7 @@ class Translator(abc.ABC):
         batch_size: int | None = None,
         progress: ProgressCallback | None = None,
         should_stop: StopCallback | None = None,
+        skip_translated: bool = False,
     ) -> Sequence[Cue]:
         """就地写入 ``cue.translation``，返回同一序列。
 
@@ -304,6 +305,11 @@ class Translator(abc.ABC):
         批内没法中断 —— 一次 HTTP 请求已经在路上，只能等它返回；实测单批
         3–5 秒，所以取消的延迟上限就是一批的时间。有了它，用户点取消后
         不必干等几十批跑完（上千条字幕要几分钟）。
+
+        ``skip_translated=True`` 时只翻 ``translation`` 仍为空的条目 —— 断点续传。
+        它和 ``should_stop`` 是一对：取消时已翻好的译文留在 cue 上，续传时跳过
+        它们，用户点一次「继续」就接上了，前面那几分钟没白跑。注意待翻条目
+        **未必是一段连续区间**（跳过的是散落的条目），所以按下标挑而不是挪起点。
         """
         # None = 没传（用引擎默认值）；0 或负数 = 调用方写错了，必须报错而不是静默兜底。
         size = self.batch_size if batch_size is None else batch_size
@@ -311,10 +317,22 @@ class Translator(abc.ABC):
             raise ValueError(f"batch_size 必须为正整数，收到 {size!r}")
 
         total = len(cues)
-        for offset in range(0, total, size):
+        pending = (
+            [index for index, cue in enumerate(cues) if not cue.is_translated]
+            if skip_translated
+            else list(range(total))
+        )
+        # 进度从「已经翻好的条数」起算：续传时进度条一上来就落在断点位置，
+        # 而不是从 0 重新爬 —— 后者会让用户以为前面的成果丢了。
+        done = total - len(pending)
+        if done and progress is not None:
+            progress(done, total)
+
+        for start in range(0, len(pending), size):
             if should_stop is not None and should_stop():
-                raise TranslationCancelled(f"已取消，完成 {offset}/{total} 条")
-            window = list(cues[offset: offset + size])
+                raise TranslationCancelled(f"已取消，完成 {done}/{total} 条")
+            chunk = pending[start: start + size]
+            window = [cues[index] for index in chunk]
             requests = [
                 TranslationRequest(
                     text=cue.text,
@@ -330,8 +348,9 @@ class Translator(abc.ABC):
                 )
             for cue, text in zip(window, results):
                 cue.translation = text
+            done += len(chunk)
             if progress is not None:
-                progress(min(offset + size, total), total)
+                progress(done, total)
         return cues
 
 

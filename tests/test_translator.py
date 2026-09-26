@@ -119,6 +119,98 @@ def test_cancelled_is_not_a_translation_error():
     assert not issubclass(TranslationCancelled, TranslationError)
 
 
+# ------------------------------------------------------------------ 断点续传
+
+
+def test_skip_translated_only_translates_the_rest():
+    """续传跳过已有译文 —— 这是断点能省下几分钟的直接原因。
+
+    待翻条目**未必连成一片**：中途取消时，可能是第 1、2、4 条翻好了、第 3 条没有，
+    所以要按下标挑而不是只挪起点。
+    """
+    cues = parse_srt(SAMPLE)
+    cues[0].translation = "[zh-CN] 已翻"
+    sent: list[str] = []
+
+    class Recorder(Translator):
+        name = "recorder"
+        batch_size = 10
+
+        def translate_batch(self, requests):
+            sent.extend(r.text for r in requests)
+            return [f"[zh-CN] {r.text}" for r in requests]
+
+    Recorder().translate_cues(
+        cues, source_lang="en", target_lang="zh-CN", skip_translated=True
+    )
+
+    assert sent == ["world"], "翻过的条目不该再发一次（白烧额度）"
+    assert cues[0].translation == "[zh-CN] 已翻", "已有译文必须原样保留"
+    assert cues[1].translation == "[zh-CN] world"
+
+
+def test_skip_translated_spreads_the_rest_over_batches():
+    """跳过的条目散落在中间时，批次要按剩下的条目重新切。"""
+    long_sample = SAMPLE + """
+3
+00:00:05,000 --> 00:00:06,000
+foo
+
+4
+00:00:07,000 --> 00:00:08,000
+bar
+"""
+    cues = parse_srt(long_sample)
+    for index in (0, 2):
+        cues[index].translation = "[zh-CN] 已翻"
+    batches: list[list[str]] = []
+
+    class Recorder(Translator):
+        name = "recorder"
+
+        def translate_batch(self, requests):
+            batches.append([r.text for r in requests])
+            return [f"[zh-CN] {r.text}" for r in requests]
+
+    Recorder().translate_cues(
+        cues, source_lang="en", target_lang="zh-CN", batch_size=1, skip_translated=True
+    )
+    assert batches == [["world"], ["bar"]], "只剩 2 条要翻，就该只发这两条"
+
+
+def test_skip_translated_reports_progress_from_the_checkpoint():
+    cues = parse_srt(SAMPLE)
+    cues[0].translation = "[zh-CN] 已翻"
+    seen: list[tuple[int, int]] = []
+    EchoTranslator().translate_cues(
+        cues,
+        source_lang="en",
+        target_lang="zh-CN",
+        batch_size=1,
+        progress=lambda done, total: seen.append((done, total)),
+        skip_translated=True,
+    )
+    assert seen == [(1, 2), (2, 2)], "进度要接着断点算，不能从头重数"
+
+
+def test_skip_translated_with_nothing_left_makes_no_request():
+    """全部翻完时不该再发任何请求（用户续传时又点了一次翻译）。"""
+    cues = parse_srt(SAMPLE)
+    for cue in cues:
+        cue.translation = f"[zh-CN] {cue.text}"
+
+    class Boom(Translator):
+        name = "boom"
+
+        def translate_batch(self, requests):
+            raise AssertionError("没有待翻条目时不该发请求")
+
+    Boom().translate_cues(
+        cues, source_lang="en", target_lang="zh-CN", skip_translated=True
+    )
+    assert all(cue.is_translated for cue in cues)
+
+
 def test_batch_size_none_uses_engine_default():
     cues = parse_srt(SAMPLE)
     seen: list[tuple[int, int]] = []

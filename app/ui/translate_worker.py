@@ -7,6 +7,10 @@
 
 所以翻译一律在 :class:`TranslateWorker` 里跑，进度与结果通过信号回到主线程。
 信号跨线程是排队投递的，槽函数仍在主线程执行，可以安全地碰界面对象。
+
+**断点也在这里写**：进度落盘是磁盘 I/O，天然属于后台线程；顺手还能保证
+「每翻完一批就有机会存一次」，取消或崩溃时最多丢一批。界面线程只负责
+在开始前读记录、结束后删记录，不参与高频写入。
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ from typing import Sequence
 
 from PySide6.QtCore import QThread, Signal
 
+from app.core.checkpoint import CheckpointWriter
 from app.core.subtitle_io import Cue
 from app.core.translator import TranslationCancelled, Translator
 
@@ -42,6 +47,8 @@ class TranslateWorker(QThread):
         *,
         source_lang: str,
         target_lang: str,
+        writer: CheckpointWriter | None = None,
+        skip_translated: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -51,6 +58,8 @@ class TranslateWorker(QThread):
         self._cues = list(cues)
         self._source_lang = source_lang
         self._target_lang = target_lang
+        self._writer = writer
+        self._skip_translated = bool(skip_translated)
         self._stop = Event()
         self._done = 0
         self._total = len(self._cues)
@@ -71,6 +80,16 @@ class TranslateWorker(QThread):
     def total(self) -> int:
         return self._total
 
+    @property
+    def checkpoint_path(self):
+        """这次翻译的断点文件路径；None 表示没启用断点。"""
+        return self._writer.path if self._writer is not None else None
+
+    @property
+    def checkpoint_error(self) -> str:
+        """最近一次写断点失败的原因（空串表示一路正常）。"""
+        return self._writer.error if self._writer is not None else ""
+
     def cancel(self) -> None:
         """请求中止。当前批次会跑完（HTTP 请求已在路上），之后不再发新请求。"""
         self._stop.set()
@@ -84,6 +103,13 @@ class TranslateWorker(QThread):
         """在**工作线程**里被引擎回调 —— 只发信号，绝不碰界面对象。"""
         self._done = done
         self.progressed.emit(done, total)
+        if self._writer is not None:
+            self._writer.maybe(self._cues)
+
+    def _flush_checkpoint(self) -> None:
+        """收尾时强制写一次，不受节流限制。"""
+        if self._writer is not None:
+            self._writer.flush(self._cues)
 
     def run(self) -> None:  # noqa: D102 - QThread 入口
         try:
@@ -93,11 +119,17 @@ class TranslateWorker(QThread):
                 target_lang=self._target_lang,
                 progress=self._emit_progress,
                 should_stop=self._stop.is_set,
+                skip_translated=self._skip_translated,
             )
         except TranslationCancelled:
+            self._flush_checkpoint()  # 取消要留住进度，下次接着翻
             self.cancelled.emit(self._done, self._total)
             return
         except Exception as exc:  # 第三方后端什么异常都可能抛，绝不能掀掉线程
+            # 失败同样要保住已翻好的部分：502 重试耗尽、中继突然挂掉，
+            # 前面十几分钟的成绩不该跟着一起丢。
+            self._flush_checkpoint()
             self.failed.emit(type(exc).__name__, str(exc))
             return
+        # 成功路径不写断点：整份都翻完了，记录由主线程删掉。
         self.succeeded.emit()

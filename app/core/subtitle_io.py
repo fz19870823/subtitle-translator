@@ -37,6 +37,15 @@ class Cue:
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
 
+    @property
+    def is_translated(self) -> bool:
+        """是否已有非空译文。
+
+        断点续传靠它挑出「还欠一次翻译」的条目。空白译文按未翻译算 ——
+        模型偶尔会吐回空串，那不是可交付的结果。
+        """
+        return bool(self.translation.strip())
+
     def render_text(self) -> str:
         """导出时使用的内容：有译文就用译文，否则回落到原文。"""
         return self.translation.strip() or self.text.strip()

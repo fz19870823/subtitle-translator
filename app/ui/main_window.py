@@ -30,6 +30,7 @@ from app.config import (
     save_config,
 )
 from app.core import subtitle_io
+from app.core import checkpoint as checkpoint_store
 from app.core.subtitle_io import Cue, SubtitleFormatError
 from app.core.translator import ENGINES, TranslationError, create_engine_for
 from app.ui.model_selector import MAX_FETCH_TIMEOUT, ModelSelector
@@ -50,6 +51,8 @@ class MainWindow(QMainWindow):
         self._worker: TranslateWorker | None = None
         #: 本次翻译的 (引擎名, 源语言, 目标语言)，成功后写进状态栏
         self._translation_meta: Tuple[str, str, str] = ("", "", "")
+        #: 断点（翻到一半的进度）存放目录
+        self._checkpoint_dir = checkpoint_store.checkpoints_dir()
 
         # 配置文件缺失不算错误（退回默认值），但 JSON 非法要明确告诉用户。
         self._config_error = ""
@@ -238,19 +241,95 @@ class MainWindow(QMainWindow):
         self.translate_button.setEnabled(True)
         self.export_button.setEnabled(True)
         self.progress.setValue(0)
-        self.statusBar().showMessage(f"已载入 {len(cues)} 条字幕")
 
-    def _on_translate(self) -> None:
-        """启动翻译。**立即返回** —— 耗时的部分在后台线程里跑。"""
-        if not self._cues or self._worker is not None:
-            return
+        # 上次翻到一半的记录要主动说出来：用户不知道有断点，就会以为只能重来。
+        plan = self._resume_plan()
+        self._sync_translate_button()
+        if plan.count:
+            self.statusBar().showMessage(
+                f"已载入 {len(cues)} 条字幕　|　上次翻到 {plan.count} 条，"
+                "点「继续翻译」接着往下走"
+            )
+        else:
+            self.statusBar().showMessage(f"已载入 {len(cues)} 条字幕")
+
+    # ---------- 断点续传 ----------
+
+    def _task_model(self, engine_name: str) -> str:
+        """当前任务实际会用的模型名。
+
+        不需要 API 的引擎（echo）没有模型概念，记空串 —— 否则配置里残留的
+        模型名会让同一份字幕的两次翻译被判成不同任务。
+        """
+        if not getattr(ENGINES.get(engine_name), "requires_api", False):
+            return ""
+        return self.model_selector.current_model().strip()
+
+    def _resume_plan(self) -> checkpoint_store.ResumePlan:
+        """看这份字幕有没有能接着用的断点。"""
+        if not self._cues or self._source_path is None:
+            return checkpoint_store.ResumePlan()
         engine_name = self.engine_combo.currentText().strip()
-        source_lang = self.source_combo.currentText().strip()
-        target_lang = self.target_combo.currentText().strip()
+        return checkpoint_store.inspect(
+            self._source_path,
+            self._cues,
+            engine=engine_name,
+            model=self._task_model(engine_name),
+            source_lang=self.source_combo.currentText().strip(),
+            target_lang=self.target_combo.currentText().strip(),
+            directory=self._checkpoint_dir,
+        )
 
+    def _sync_translate_button(self) -> None:
+        """按钮文案跟着状态走：有断点时叫「继续翻译」，否则叫「翻译」。"""
+        plan = self._resume_plan()
+        self.translate_button.setText("继续翻译" if plan.count else "翻译")
+
+    def _ask_resume(self, plan: checkpoint_store.ResumePlan) -> str:
+        """问用户要不要接着上次翻。返回 ``resume`` / ``restart`` / ``cancel``。
+
+        必须是三选而不是两选：既然做不了主（用户可能刚换了模型想整份重来），
+        就不能把「继续」做成唯一的出路，「取消」也不该和「重新开始」挤在一起。
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("继续上次的翻译")
+        box.setText(f"这份字幕上次翻到一半：已译 {plan.count} / {len(self._cues)} 条。")
+        box.setInformativeText(
+            "继续：只翻译剩下的条目，接着上次的译文往下走（省时间也省额度）。\n"
+            "重新开始：丢弃这份记录，整份字幕重译一遍。"
+        )
+        resume_button = box.addButton("继续", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("重新开始", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(resume_button)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is resume_button:
+            return "resume"
+        if clicked is None or clicked.text() == "取消":
+            return "cancel"
+        return "restart"
+
+    def _start_translation(
+        self,
+        engine_name: str,
+        source_lang: str,
+        target_lang: str,
+        *,
+        skip_translated: bool,
+        note: str = "",
+    ) -> None:
+        """构造引擎与后台线程并启动。断点相关的前置判断已经在外面做完了。
+
+        ``note`` 是启动时顺带要告诉用户的一句话（比如「上次的记录用不上」）。
+        它必须由这里一起写进状态栏 —— 在外面先写会被下面的「翻译中…」覆盖掉。
+        """
         # 界面上临时选的模型要即时生效，否则会悄悄沿用配置文件里的旧值。
         # 想持久化就走「设置…」。
-        if getattr(ENGINES.get(engine_name), "requires_api", False):
+        requires_api = bool(getattr(ENGINES.get(engine_name), "requires_api", False))
+        if requires_api:
             self._config.translation.model = self.model_selector.current_model()
 
         # 引擎构造留在主线程：它只读配置、不发网络请求，出错时能同步弹窗。
@@ -265,6 +344,19 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("翻译失败")
             return
 
+        writer = None
+        if self._source_path is not None:
+            writer = checkpoint_store.CheckpointWriter(
+                checkpoint_store.checkpoint_path(
+                    self._source_path, directory=self._checkpoint_dir
+                ),
+                source_path=self._source_path,
+                engine=engine_name,
+                model=self._task_model(engine_name),
+                source_lang=source_lang,
+                target_lang=target_lang,
+            )
+
         # 真正耗时的部分必须进后台线程：上千条字幕要发几十次请求、跑好几分钟，
         # 放在主线程里窗口会整个冻住（进度条不动、取消都点不了）。
         self._translation_meta = (engine_name, source_lang, target_lang)
@@ -273,6 +365,8 @@ class MainWindow(QMainWindow):
             self._cues,
             source_lang=source_lang,
             target_lang=target_lang,
+            writer=writer,
+            skip_translated=skip_translated,
             parent=self,
         )
         worker.progressed.connect(self._on_progress)
@@ -281,15 +375,66 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._on_translate_failed)
         self._worker = worker  # 保留引用：线程被回收会连带丢掉信号连接
         self._set_busy(True)
-        self.progress.setValue(0)
-        self.statusBar().showMessage(f"翻译中…（共 {len(self._cues)} 条）")
+        total = len(self._cues)
+        already = sum(1 for cue in self._cues if cue.is_translated)
+        # 续传时进度条立刻落在断点处，不干等第一批请求回来 —— 否则用户会以为
+        # 之前的进度丢了，或者以为又在从头翻。
+        self.progress.setValue(
+            0 if not already or not total else int(already / total * 100)
+        )
+        if skip_translated and already:
+            message = f"接着上次翻译…（还剩 {total - already} 条，共 {total} 条）"
+        else:
+            message = f"翻译中…（共 {total} 条）"
+        self.statusBar().showMessage(f"{note}　|　{message}" if note else message)
         worker.start()
+
+    def _on_translate(self) -> None:
+        """启动翻译。**立即返回** —— 耗时的部分在后台线程里跑。"""
+        if not self._cues or self._worker is not None:
+            return
+        engine_name = self.engine_combo.currentText().strip()
+        source_lang = self.source_combo.currentText().strip()
+        target_lang = self.target_combo.currentText().strip()
+
+        # 有断点就先问一句：接上去还是从头来，这个决定只能由用户做。
+        plan = self._resume_plan()
+        skip_translated = False
+        note = ""
+        if plan.count:
+            choice = self._ask_resume(plan)
+            if choice == "cancel":
+                self.statusBar().showMessage(f"已取消（保留着 {plan.count} 条的进度）")
+                return
+            if choice == "resume":
+                # 把上次的译文先填回 cue，后台线程只补没翻的部分。
+                for index, text in plan.usable.items():
+                    self._cues[index].translation = text
+                skip_translated = True
+        elif plan.rejected:
+            # 不能静默失效：用户以为在接着翻，实际从头开始了，很难察觉。
+            note = f"已忽略上次的翻译记录：{plan.rejected}"
+
+        self._start_translation(
+            engine_name,
+            source_lang,
+            target_lang,
+            skip_translated=skip_translated,
+            note=note,
+        )
 
     # ---------- 后台线程的回调（信号跨线程排队投递，槽仍在主线程执行） ----------
 
     def _on_translate_succeeded(self) -> None:
-        engine = self._worker.engine if self._worker is not None else None
+        worker = self._worker
+        engine = worker.engine if worker is not None else None
+        checkpoint_path = worker.checkpoint_path if worker is not None else None
         self._finish_translation()
+
+        # 整份都翻完了，断点就没了意义。留着还会在下次打开同一份字幕时
+        # 冒出一句「上次翻到 N 条」—— 那会把已经完成的任务说成没做完。
+        checkpoint_store.clear(checkpoint_path)
+        self._sync_translate_button()
 
         self.editor.setPlainText(subtitle_io.to_srt(self._cues))
         engine_name, source_lang, target_lang = self._translation_meta
@@ -311,16 +456,36 @@ class MainWindow(QMainWindow):
             )
 
     def _on_translate_cancelled(self, done: int, total: int) -> None:
+        worker = self._worker
+        error = worker.checkpoint_error if worker is not None else ""
         self._finish_translation()
-        # 已翻好的部分留着：用户能核对或导出半成品，不必从头再来。
+        # 已翻好的部分留着：用户能核对或导出半成品，也不必从头再来。
         self.editor.setPlainText(subtitle_io.to_srt(self._cues))
-        self.statusBar().showMessage(f"已取消：{done}/{total} 条已翻译")
+        message = f"已取消：{done}/{total} 条已翻译"
+        if error:
+            # 断点没写成功要说出来：用户以为能续传、实际只能重来，比不给断点更糟。
+            message += f"　|　进度未能保存（{error}），下次需要重来"
+        elif done:
+            message += "　|　进度已保存，下次可从中断处继续"
+        self.statusBar().showMessage(message)
+        self._sync_translate_button()
 
     def _on_translate_failed(self, kind: str, message: str) -> None:
+        worker = self._worker
+        resumable = (
+            worker is not None
+            and worker.checkpoint_path is not None
+            and worker.done > 0
+        )
         self._finish_translation()
         text = message if kind == "TranslationError" else f"{kind}: {message}"
+        if resumable:
+            text += (
+                "\n\n已翻好的部分已经存下来了，处理完问题点「继续翻译」就能接着来。"
+            )
         QMessageBox.critical(self, "翻译失败", text)
         self.statusBar().showMessage("翻译失败")
+        self._sync_translate_button()
 
     def _on_cancel(self) -> None:
         if self._worker is None:

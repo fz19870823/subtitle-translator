@@ -14,6 +14,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
+# 翻译断点（翻到一半的进度）存放处。与 output/ 分开：那边是给用户看的成品，
+# 这边是内部状态，用户不该在成品目录里看到一堆看不懂的 json。
+CHECKPOINT_DIR = DATA_DIR / "checkpoints"
+
 # 本地配置：不入版本库（见 .gitignore 的 config.local.json / *.local.json）。
 CONFIG_FILE = PROJECT_ROOT / "config.local.json"
 
@@ -224,5 +228,5 @@ def save_config(config: AppConfig, path: str | Path | None = None) -> Path:
 
 def ensure_runtime_dirs() -> None:
     """创建应用会写入的目录，可重复调用。"""
-    for directory in (DATA_DIR, OUTPUT_DIR):
+    for directory in (DATA_DIR, OUTPUT_DIR, CHECKPOINT_DIR):
         directory.mkdir(parents=True, exist_ok=True)
