@@ -172,15 +172,17 @@ def test_to_dict_covers_every_known_field():
         timeout=9,
         temperature=0.5,
         preserve_line_breaks=False,
+        stream=False,
         style_hint="人名保留原文",
     )
     dumped = t.to_dict()
     assert set(dumped) == {
         "engine", "base_url", "model", "api_key", "api_key_file",
         "batch_size", "timeout", "temperature", "preserve_line_breaks",
-        "style_hint",
+        "stream", "style_hint",
     }
     assert dumped["preserve_line_breaks"] is False
+    assert dumped["stream"] is False
     assert dumped["style_hint"] == "人名保留原文"
 
 

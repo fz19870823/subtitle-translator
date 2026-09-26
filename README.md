@@ -17,12 +17,17 @@ subtitle-translator/
 ├── scripts/
 │   ├── check_api.py                # 在线自检：API / 模型配置 + 真实翻译冒烟
 │   ├── diag_echo.py                # 诊断：量化「原样回抄」的形态与频率
+│   ├── diag_cancel_latency.py      # 诊断：模型「思考」期间取消检查到底有没有在跑
+│   ├── diag_https_stream.py        # 诊断：流式读取失败那一刻的连接内部状态
 │   ├── probe_echo_mechanism.py     # 判别：回抄是「模型不会翻」还是「请求没被执行」
+│   ├── probe_stream_read.py        # 判别：读阻塞期间能不能查到取消（四条路线）
+│   ├── probe_live_stream.py        # 对照：真实中继上「线程读」与「主线程读」
 │   ├── measure_echo_cost.py        # 度量：防护多花多少请求、最后残留几条
 │   ├── verify_echo_fix.py          # 验证：回抄是否被拦住（含修复前后对照）
 │   ├── verify_http_retry.py        # 验证：502 等链路故障是否被自动重试
 │   ├── verify_resume.py            # 验证：中断后接着翻，省下多少请求
 │   ├── verify_queue.py             # 验证：多文件依次翻完、各自落盘、失败不拖住后面
+│   ├── verify_stream_cancel.py     # 验证：流式让取消快多少（本地四场景 + --live）
 │   └── verify_ui_responsive.py     # 度量：翻译期间主线程最长被阻塞多久
 ├── app/
 │   ├── config.py                   # 常量、运行时目录、本地配置加载
@@ -46,6 +51,7 @@ subtitle-translator/
     ├── test_checkpoint.py          # 断点记录的读写、复用判定与写入节流
     ├── test_queue.py               # 队列状态机：入队、排序、跳过失败、重置
     ├── test_openai_compat.py       # 协议解析、换行处理、模型列表、链路重试（不联网）
+    ├── test_streaming.py           # 流式接收：SSE 解析、增量切元素、取消抢救、降级路径
     ├── test_ui_smoke.py            # 主窗口冒烟（需要 PySide6，否则跳过）
     └── test_ui_settings.py         # 模型控件与设置对话框（同上）
 ```
@@ -110,6 +116,7 @@ copy config.example.json config.local.json
     "timeout": 120,
     "temperature": 0,
     "preserve_line_breaks": true,
+    "stream": true,
     "style_hint": ""
   }
 }
@@ -124,6 +131,7 @@ copy config.example.json config.local.json
 | `api_key` | 直接写明文密钥（优先级低于环境变量、高于 `api_key_file`） |
 | `batch_size` | 单次请求携带多少条字幕 |
 | `preserve_line_breaks` | 保留字幕行内换行结构，多行条目不被合并成一行（默认 `true`） |
+| `stream` | 用流式（SSE）接收响应，让「取消」立刻生效（默认 `true`；中继的流式实现有问题时设 `false` 退回整段接收） |
 | `style_hint` | 追加到 system prompt 的风格/术语约束，如 `"人名保留原文"` |
 
 环境变量优先级最高：`SUBTITLE_TRANSLATOR_API_KEY` / `SUBTITLE_TRANSLATOR_BASE_URL` /
@@ -157,9 +165,9 @@ copy config.example.json config.local.json
   模型 / 上下文窗口 / 导出 / **队列列表**）。不锁的话，用户中途换字幕文件，后台线程
   还在往旧对象里写译文，界面最终会显示一份与当前文件对不上的结果 —— 而且看不出
   哪里错了。列表也要锁：点一下就能把**另一份**字幕摆进编辑器，同样会错位。
-- **提供取消。** 取消在**批与批之间**生效（`translate_cues(should_stop=...)`）：
-  批内无法中断，HTTP 请求已经在路上，所以延迟上限就是一批的时间。
-  已翻好的部分会保留，可以核对或导出半成品，不必从头再来。
+- **提供取消，而且点了就停。** 请求默认走流式接收（`stream: true`），响应一个分片
+  一个分片地到，取消在分片之间生效 —— 延迟上限是**一个轮询间隔（0.2 s）**，
+  不是一批的时间。已经完整收到的那几条也会保留。详见下一节。
 - **关窗先送走线程**（`closeEvent`）。窗口对象一被回收，还在运行的 QThread
   会踩到野指针，Qt 会报 `Destroyed while thread is still running` 并可能崩进程。
 
@@ -182,6 +190,68 @@ copy config.example.json config.local.json
 窗口不重绘、按钮不加响应、进度条不动、取消点不了。同样一档速度下，上千条字幕
 （约 50 批）会连续冻住五分钟以上。改成后台线程后，主线程最长只停了 23 ms，
 和 QTimer 的 20 ms 周期同量级 —— 也就是它只做了信号投递这点活。
+
+## 流式接收（取消为什么能立刻生效）
+
+一次请求可能带 200 条字幕（上下文窗口上限），整批返回要十几秒甚至更久。
+如果等整批回来才看得到取消，用户点下按钮之后就是十几秒的「什么都没发生」——
+和卡死没有区别。所以请求默认带 `stream: true`，改成边收边解析：
+
+- 响应是一个个 SSE 分片（`data: {...}`），`app/core/engines/openai_compat.py`
+  里 `iter_sse_deltas()` 负责读，`ArrayStreamParser` 负责**增量切元素** ——
+  不等整段收完，每收完一个完整的字符串元素就交出一条。
+- 取消命中时，**已经完整收到的条目照样落盘**（`TranslationCancelled` 会带上
+  `items`），不必白等前面那十几秒。
+- 抢救回来的条目要过一遍**回抄判据**：取消发生在回抄检查之前，直接落盘会把
+  「原样退回的原文」当成译文。宁可少救，不能救回没翻的。
+
+### 三处地方必须离开调用方线程
+
+读阻塞的时候，取消检查根本轮不到。这条路上踩了三个坑，全部实测过：
+
+| 坑 | 症状（实测） | 处置 |
+| --- | --- | --- |
+| 读取在主线程 | 模型「思考」期间点取消，要等到它开口（延迟 2.0 s，整段 12.5 s） | 读取挪进后台线程（`_StreamReader`），调用方只在队列上等 0.2 s |
+| 打开连接在主线程 | 网关把响应头**憋到第一个分片就绪**才发，`urlopen` 阻塞 3.55 s —— 这几秒里取消检查没机会跑（线上 0.5 s 点取消、3.5 s 才返回） | 打开动作也挪进线程（`_open_cancellable`） |
+| 关闭连接在主线程 | 读线程握着 `BufferedReader` 的内部锁，`close()` 要拿同一把锁，取消卡在收尾上（延迟 1.68 s，期间取消回调一次都没再被调用） | 关闭丢给后台线程（`_release_stream`） |
+
+> 曾经试过「把 socket 读超时调短，让阻塞的读自己醒来」——那条路在**明文 HTTP** 上
+> 成立，但在真实中继（TLS）上超时十几次后就提前收到 EOF，整段内容一个字都收不到。
+> 证据与复现脚本：`scripts/probe_stream_read.py`、`scripts/probe_live_stream.py`、
+> `scripts/diag_https_stream.py`。所以最终没有碰 socket 的任何内部状态。
+
+### 流式只是优化，坏掉不该让翻译不可用
+
+三条降级路径都通向「一次性接收」，记一笔 `stream_fallback_count`，并在状态栏提示：
+
+| 触发 | 动作 |
+| --- | --- |
+| 中继没理会 `stream`（`Content-Type` 不是 `event-stream`） | 读全文按整段解析 |
+| 流读到一半断了（连接重置 / 读超时 / `IncompleteRead`） | 半截内容没法确认完整性，重发一次整段请求 |
+| 声明了事件流却一个分片都没给 | 实测真实中继会**偶发**这样回来，同样退回整段接收再问一次 |
+
+真到了「整段也空手而归」，才会报错并说明可以在 `config.local.json` 里把
+`"stream"` 设为 `false`。
+
+### 验证
+
+```
+.venv\Scripts\python.exe scripts\verify_stream_cancel.py           # 本地 http.server，四个场景
+.venv\Scripts\python.exe scripts\verify_stream_cancel.py --live 6  # 顺便量一次真实中继
+```
+
+本地服务端会注入「模型先思考」（先睡 2 s 再吐第一个分片）、逐条间隔、以及
+「整段接收」的对照；并记录每条发出的时刻，用来证明**客户端确实提前断开**。
+
+实测（`grok-chat-fast`，日文 → 中文）：
+
+| 场景 | 取消 → 返回 | 说明 |
+| --- | --- | --- |
+| 本地 · 普通流式 | **0.14 s** | 轮询间隔就是上限 |
+| 本地 · 模型先思考 2 s | **0.03 s** | 思考期间点取消照样立刻停 |
+| 本地 · 整段接收（分 4 批） | 0.43 s | ≈ 一批剩下的时间 |
+| 本地 · 整段接收（只有一批） | 2.43 s（**跑完**） | 没机会中断 |
+| 真实中继 · 整段 10.7 s、第一个分片 5.3 s | **0.62 s** | 三处坑都填上之后（修之前是 3.49 s） |
 
 ## 断点续传（翻译中断后接着翻）
 
@@ -520,6 +590,11 @@ class MyLlmTranslator(Translator):
 - [x] 队列里某份失败跳过继续下一个，跑完统一汇报；取消则停下整条队列
 - [x] 队列验证脚本 `scripts/verify_queue.py`（离线，含坏文件剔除与同名冲突校验）
 - [x] 添加字幕只有一个入口（队列的「添加文件…」，可多选）；点列表某项即载入编辑器
+- [x] 流式接收（SSE）：取消在分片之间生效，延迟上限是一个轮询间隔（0.2 s）
+- [x] 读取 / 打开 / 关闭三处都离开调用方线程，HTTP 与 HTTPS 行为一致
+- [x] 取消时保住已经完整收到的条目，并过一遍回抄判据再落盘
+- [x] 三条流式降级路径（中继忽略 `stream` / 中途断流 / 空事件流）自动退回整段接收
+- [x] 流式取消验证脚本 `scripts/verify_stream_cancel.py`（本地四场景 + `--live`）
 - [ ] ASS / SSA 支持
 - [ ] 双语对照导出（原文 + 译文同时保留）
 - [ ] 并发请求以提升长字幕的翻译速度

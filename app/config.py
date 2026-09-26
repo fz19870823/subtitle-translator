@@ -59,6 +59,9 @@ class TranslationConfig:
     temperature: float = 0.0
     #: 强制保留原文行内换行结构（多行字幕不被合并成一行）。
     preserve_line_breaks: bool = True
+    #: 用 ``stream: true`` 接收响应。开启时取消能在分片之间立刻生效，
+    #: 不必等整批返回；中继不支持时引擎会自动降级，关掉它主要是为了排查。
+    stream: bool = True
     #: 追加到 system prompt 的术语/风格约束，例如 "人名保留原文"。
     style_hint: str = ""
     extra: dict = field(default_factory=dict)
@@ -110,6 +113,7 @@ class TranslationConfig:
             "timeout": self.timeout,
             "temperature": self.temperature,
             "preserve_line_breaks": self.preserve_line_breaks,
+            "stream": self.stream,
             "style_hint": self.style_hint,
         }
         return {**(self.extra or {}), **known}
@@ -175,7 +179,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     known = {
         "engine", "base_url", "model", "api_key", "api_key_file",
         "batch_size", "timeout", "temperature", "style_hint",
-        "preserve_line_breaks",
+        "preserve_line_breaks", "stream",
     }
     kwargs = {k: v for k, v in section.items() if k in known}
     extra = {k: v for k, v in section.items() if k not in known}

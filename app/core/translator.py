@@ -8,7 +8,7 @@ from __future__ import annotations
 import abc
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Sequence, Type
+from typing import TYPE_CHECKING, Callable, Dict, List, Sequence, Tuple, Type
 
 from app.core.subtitle_io import Cue
 
@@ -25,7 +25,30 @@ class TranslationCancelled(RuntimeError):
 
     **刻意不继承** :class:`TranslationError`：取消是用户的正常选择，不是故障。
     若继承，界面上「翻译失败」的弹窗会把主动取消也报成错误。
+
+    取消可以**带东西回来**：引擎在一批的中途被打断时，已经完整拿到的部分
+    通过下面两个字段交出去，免得用户白等这一批（一批可能有 200 条）：
+
+    - ``items``：引擎侧的原始元素，与送出的数组同序。支持流式读取的引擎填它
+      （``_chat_stream`` 里每解析出一个完整元素就记一个）。
+    - ``partial``：``(本批请求内的下标, 译文)``，由 :meth:`Translator.translate_cues`
+      读取并写回 cue。**这才是引擎与调度层之间的约定** —— 具体引擎不必自己算
+      下标（元素下标 ≠ 请求下标：空条目不会被送给模型），由 ``translate_batch``
+      换算好再抛出。
     """
+
+    def __init__(
+        self,
+        message: str = "已取消",
+        *,
+        items: "Sequence[str] | None" = None,
+        partial: "Sequence[Tuple[int, str]] | None" = None,
+    ) -> None:
+        super().__init__(message)
+        #: 已经完整收到、可以确认的原始元素（与送出的数组同序）
+        self.items: List[str] = list(items or ())
+        #: 已经完成的 (本批请求内的下标, 译文)，由 translate_batch 换算后填
+        self.partial: List[Tuple[int, str]] = list(partial or ())
 
 
 #: 任意语言的字母（拉丁、西里尔、希腊、假名、汉字、谚文…）。
@@ -258,6 +281,20 @@ class Translator(abc.ABC):
     http_retry_count = 0
     #: 重发原因分布，如 ``{"HTTP 502": 2}``
     http_retry_reasons: Dict[str, int] = {}
+    #: 中继不支持流式 / 流中途断掉，退回一次性请求的次数
+    stream_fallback_count = 0
+
+    #: 本次翻译「要不要停」的回调，由 :meth:`translate_cues` 开跑前挂上、跑完摘掉。
+    #:
+    #: 存在的理由：``should_stop`` 过去只在**批与批之间**被查一次，一批要 3–10 秒
+    #: （上下文窗口 200 时更久）。支持流式读取的引擎可以每隔一个分片问一次，
+    #: 把取消的生效延迟从「一批」压到「几十毫秒」，并顺手把已经收到的条目留下。
+    _stop_check: "StopCallback | None" = None
+
+    def should_stop(self) -> bool:
+        """本次翻译是否已被要求中止（引擎内部用，尤其是流式读取的中途）。"""
+        check = getattr(self, "_stop_check", None)
+        return bool(check is not None and check())
 
     def quality_notes(self, *, include_untranslated: bool = True) -> List[str]:
         """用一句话概括本次翻译的质量插曲，供界面提示。
@@ -285,6 +322,13 @@ class Translator(abc.ABC):
             if reasons:
                 detail = "（" + "、".join(f"{k}×{v}" for k, v in reasons.items()) + "）"
             notes.append(f"链路临时故障自动重试 {self.http_retry_count} 次{detail}")
+        if getattr(self, "stream_fallback_count", 0):
+            # 流式只是「让取消更快生效」的优化，它不可用时用户会明显觉得取消变慢
+            # （要等当前这一批返回）。不说一声，用户会以为是程序坏了。
+            notes.append(
+                f"流式不可用，整段接收 {self.stream_fallback_count} 次"
+                "（点取消要等当前这批返回）"
+            )
         if include_untranslated and self.untranslated_count:
             notes.append(f"仍有 {self.untranslated_count} 条疑似未翻译")
         return notes
@@ -315,6 +359,11 @@ class Translator(abc.ABC):
         它和 ``should_stop`` 是一对：取消时已翻好的译文留在 cue 上，续传时跳过
         它们，用户点一次「继续」就接上了，前面那几分钟没白跑。注意待翻条目
         **未必是一段连续区间**（跳过的是散落的条目），所以按下标挑而不是挪起点。
+
+        它还会把 ``should_stop`` 挂到 ``self._stop_check`` 上，让引擎在**一次请求
+        内部**也能查到取消 —— 支持流式读取的引擎据此把生效延迟从「一批」压到
+        「下一个分片」，并在被打断时把已经完整拿到的条目放进
+        :attr:`TranslationCancelled.partial` 交回来（下面会写回 cue，计入进度）。
         """
         # None = 没传（用引擎默认值）；0 或负数 = 调用方写错了，必须报错而不是静默兜底。
         size = self.batch_size if batch_size is None else batch_size
@@ -333,30 +382,64 @@ class Translator(abc.ABC):
         if done and progress is not None:
             progress(done, total)
 
-        for start in range(0, len(pending), size):
-            if should_stop is not None and should_stop():
-                raise TranslationCancelled(f"已取消，完成 {done}/{total} 条")
-            chunk = pending[start: start + size]
-            window = [cues[index] for index in chunk]
-            requests = [
-                TranslationRequest(
-                    text=cue.text,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                )
-                for cue in window
-            ]
-            results = self.translate_batch(requests)
-            if len(results) != len(window):
-                raise TranslationError(
-                    f"引擎 {self.name!r} 返回 {len(results)} 条结果，期望 {len(window)} 条"
-                )
-            for cue, text in zip(window, results):
-                cue.translation = text
-            done += len(chunk)
-            if progress is not None:
-                progress(done, total)
+        # 引擎在一次请求内部也能查到取消（流式读取的每个分片之间查一次）。
+        # 用 try/finally 摘掉：引擎实例可能被复用，留着会让下一次任务刚开跑就"被取消"。
+        self._stop_check = should_stop
+        try:
+            for start in range(0, len(pending), size):
+                if should_stop is not None and should_stop():
+                    raise TranslationCancelled(f"已取消，完成 {done}/{total} 条")
+                chunk = pending[start: start + size]
+                window = [cues[index] for index in chunk]
+                requests = [
+                    TranslationRequest(
+                        text=cue.text,
+                        source_lang=source_lang,
+                        target_lang=target_lang,
+                    )
+                    for cue in window
+                ]
+                try:
+                    results = self.translate_batch(requests)
+                except TranslationCancelled as exc:
+                    # 流式引擎被打断时可能已经把这一批里先到的几条交出来了。
+                    # 先写回字幕再往上抛：用户点一次取消，不该把这一整批都丢掉。
+                    kept = _apply_partial(window, exc.partial)
+                    done += kept
+                    if kept and progress is not None:
+                        progress(done, total)
+                    raise TranslationCancelled(
+                        f"已取消，完成 {done}/{total} 条"
+                    ) from None
+                if len(results) != len(window):
+                    raise TranslationError(
+                        f"引擎 {self.name!r} 返回 {len(results)} 条结果，期望 {len(window)} 条"
+                    )
+                for cue, text in zip(window, results):
+                    cue.translation = text
+                done += len(chunk)
+                if progress is not None:
+                    progress(done, total)
+        finally:
+            self._stop_check = None
         return cues
+
+
+def _apply_partial(window: Sequence[Cue], partial: "Sequence[Tuple[int, str]]") -> int:
+    """把取消时抢救回来的译文写回这批 cue，返回实际写入的条数。
+
+    下标越界、空文本一律跳过：这些内容来自引擎，而引擎是可能被换掉的第三方
+    实现，宁可少记几条「已完成」，也不能让它把译文写到别的条目上。
+    """
+    kept = 0
+    for index, text in partial or ():
+        if not isinstance(index, int) or not 0 <= index < len(window):
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        window[index].translation = text
+        kept += 1
+    return kept
 
 
 class EchoTranslator(Translator):
