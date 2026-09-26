@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Sequence, Type
+from typing import TYPE_CHECKING, Callable, Dict, List, Sequence, Type
 
 from app.core.subtitle_io import Cue
+
+if TYPE_CHECKING:  # 只为类型标注，运行时不引入，避免循环依赖
+    from app.config import AppConfig
 
 
 class TranslationError(RuntimeError):
@@ -53,9 +56,10 @@ class Translator(abc.ABC):
         progress: ProgressCallback | None = None,
     ) -> Sequence[Cue]:
         """就地写入 ``cue.translation``，返回同一序列。"""
-        size = batch_size or self.batch_size
+        # None = 没传（用引擎默认值）；0 或负数 = 调用方写错了，必须报错而不是静默兜底。
+        size = self.batch_size if batch_size is None else batch_size
         if size <= 0:
-            raise ValueError("batch_size 必须为正整数")
+            raise ValueError(f"batch_size 必须为正整数，收到 {size!r}")
 
         total = len(cues)
         for offset in range(0, total, size):
@@ -113,6 +117,25 @@ def create_engine(name: str, **kwargs) -> Translator:
             f"未知的翻译引擎 {name!r}，可用: {sorted(ENGINES)}"
         ) from None
     return factory(**kwargs)
+
+
+def create_engine_for(name: str, app_config: "AppConfig | None" = None) -> Translator:
+    """按配置构造引擎。
+
+    需要外部参数的引擎（如 OpenAI 兼容后端）实现 ``from_config(cfg)`` 类方法；
+    不需要的（如 echo）直接无参实例化。这样界面层不必知道每个引擎要什么参数。
+    """
+    try:
+        factory = ENGINES[name]
+    except KeyError:
+        raise TranslationError(
+            f"未知的翻译引擎 {name!r}，可用: {sorted(ENGINES)}"
+        ) from None
+
+    from_config = getattr(factory, "from_config", None)
+    if callable(from_config) and app_config is not None:
+        return from_config(app_config.translation)
+    return factory()
 
 
 register(EchoTranslator)

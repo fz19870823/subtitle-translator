@@ -22,11 +22,14 @@ from app.config import (
     APP_NAME,
     DEFAULT_SOURCE_LANG,
     DEFAULT_TARGET_LANG,
+    AppConfig,
+    ConfigError,
     ensure_runtime_dirs,
+    load_config,
 )
 from app.core import subtitle_io
 from app.core.subtitle_io import Cue, SubtitleFormatError
-from app.core.translator import ENGINES, TranslationError, create_engine
+from app.core.translator import ENGINES, TranslationError, create_engine_for
 
 
 class MainWindow(QMainWindow):
@@ -35,6 +38,15 @@ class MainWindow(QMainWindow):
         ensure_runtime_dirs()
         self._cues: List[Cue] = []
         self._source_path: Path | None = None
+
+        # 配置文件缺失不算错误（退回默认值），但 JSON 非法要明确告诉用户。
+        self._config_error = ""
+        try:
+            self._config = load_config()
+        except ConfigError as exc:
+            self._config = AppConfig()
+            self._config_error = str(exc)
+
         self.setWindowTitle(f"{APP_NAME} — 字幕翻译")
         self.resize(1000, 660)
         self._build_ui()
@@ -62,6 +74,10 @@ class MainWindow(QMainWindow):
 
         self.engine_combo = QComboBox()
         self.engine_combo.addItems(sorted(ENGINES))
+        # 默认选中配置里指定的引擎（若该引擎未注册则保持第一项）
+        configured_engine = self._config.translation.engine
+        if configured_engine in ENGINES:
+            self.engine_combo.setCurrentText(configured_engine)
 
         self.translate_button = QPushButton("翻译")
         self.translate_button.clicked.connect(self._on_translate)
@@ -89,11 +105,26 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
 
+        self.config_label = QLabel(self._config_summary())
+        self.config_label.setStyleSheet("color: palette(mid);")
+
         layout = QVBoxLayout(central)
         layout.addLayout(file_row)
         layout.addLayout(control_row)
+        layout.addWidget(self.config_label)
         layout.addWidget(self.editor, 1)
         layout.addWidget(self.progress)
+
+    def _config_summary(self) -> str:
+        """配置摘要。只报告密钥来源，绝不显示密钥内容。"""
+        if self._config_error:
+            return f"配置有误：{self._config_error}"
+        info = self._config.describe()
+        return (
+            f"配置 {info['config_file']}　|　引擎 {info['engine']}　|　"
+            f"模型 {info['model'] or '(未设置)'}　|　"
+            f"地址 {info['base_url'] or '(未设置)'}　|　密钥 {info['key_origin']}"
+        )
 
     @staticmethod
     def _language_combo(values: Tuple[str, ...], current: str) -> QComboBox:
@@ -134,14 +165,14 @@ class MainWindow(QMainWindow):
         target_lang = self.target_combo.currentText().strip()
 
         try:
-            engine = create_engine(engine_name)
+            engine = create_engine_for(engine_name, self._config)
             engine.translate_cues(
                 self._cues,
                 source_lang=source_lang,
                 target_lang=target_lang,
                 progress=self._on_progress,
             )
-        except TranslationError as exc:
+        except (TranslationError, ConfigError) as exc:
             QMessageBox.critical(self, "翻译失败", str(exc))
             self.statusBar().showMessage("翻译失败")
             return
