@@ -57,7 +57,6 @@ logs/
 # ---- 凭据：翻译 API 的本地密钥一律不入库 ----
 .env
 *.local.json
-config.local.json
-# save_config() 写文件时的备份与临时文件
-config.local.json.bak
-config.local.json.tmp
+# 覆盖 config.local.json 本体及其全部派生物：
+# save_config() 写的 .bak / .tmp，以及手动备份（.bak.20260926 之类）
+config.local.json*
