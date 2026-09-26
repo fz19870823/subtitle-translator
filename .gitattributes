@@ -1,0 +1,17 @@
+# 统一按 LF 存储与检出，避免 Windows 上反复出现 LF/CRLF 转换告警
+* text=auto eol=lf
+
+# 明确按二进制处理，防止被文本转换破坏
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.mp4 binary
+*.mkv binary
+*.zip binary
+*.7z binary
