@@ -45,6 +45,8 @@ class QueuePanel(QWidget):
     add_requested = Signal()
     #: 用户点了「依次翻译」
     start_requested = Signal()
+    #: 用户点了「重试未翻译」—— 只重翻各文件里没翻出来的那几条
+    retry_requested = Signal()
     #: 用户选中了某一项：(下标)——主窗口据此把那一份摆进编辑器
     item_selected = Signal(int)
     #: 队列内容变了（增/删/移），主窗口据此刷新它自己那部分状态
@@ -94,6 +96,9 @@ class QueuePanel(QWidget):
         self.clear_button = QPushButton("清空")
         self.clear_button.clicked.connect(self._on_clear)
 
+        self.retry_button = QPushButton("重试未翻译")
+        self.retry_button.clicked.connect(self.retry_requested.emit)
+
         self.start_button = QPushButton("依次翻译")
         self.start_button.clicked.connect(self.start_requested.emit)
 
@@ -105,6 +110,7 @@ class QueuePanel(QWidget):
         buttons.addWidget(self.down_button)
         buttons.addWidget(self.clear_button)
         buttons.addStretch(1)
+        buttons.addWidget(self.retry_button)
         buttons.addWidget(self.start_button)
 
         layout = QVBoxLayout(self)
@@ -192,6 +198,23 @@ class QueuePanel(QWidget):
             self.start_button,
         ):
             button.setVisible(has_items)
+
+        # 「重试未翻译」只在真有东西可重试时才出现 —— 一个长期灰着的按钮，
+        # 用户只会去猜它什么时候能用。它也不跟着 has_items 走：队列空着时
+        # 本来就不可能有未翻译条目。
+        stuck = counts["untranslated"]
+        show_retry = bool(stuck) and not self._busy
+        self.retry_button.setVisible(show_retry)
+        self.retry_button.setEnabled(show_retry)
+        if show_retry:
+            self.retry_button.setText(f"重试未翻译（{stuck}）")
+            self.retry_button.setToolTip(
+                f"{counts['stuck_files']} 个文件里共 {stuck} 条没翻出来。\n"
+                "点一下会依次重翻这几条：只碰没翻出来的部分，已翻好的一个字不动，\n"
+                "译文文件原地更新。\n\n"
+                "这些条目在引擎里已经自动重试过三次，原样再试往往没用 ——"
+                "先换个模型、或把上下文窗口调小（例如 1 条/次），成功率会高很多。"
+            )
 
         editable = not self._busy
         self.add_button.setEnabled(editable)

@@ -415,14 +415,43 @@ class Translator(abc.ABC):
                     raise TranslationError(
                         f"引擎 {self.name!r} 返回 {len(results)} 条结果，期望 {len(window)} 条"
                     )
-                for cue, text in zip(window, results):
-                    cue.translation = text
+                _apply_results(window, results, target_lang)
                 done += len(chunk)
                 if progress is not None:
                     progress(done, total)
         finally:
             self._stop_check = None
         return cues
+
+
+def _apply_results(
+    window: Sequence[Cue], results: Sequence[str], target_lang: str
+) -> int:
+    """把引擎返回的译文写回这批 cue，返回其中「确认没翻出来」的条数。
+
+    引擎会尽力（整批重发、逐条重译，共三轮），但它交回来的东西仍可能是原文 ——
+    那就不能当译文收下。定罪沿用与引擎内部**同一套**判据
+    （:func:`locate_untranslated`）：只有原文的书写族根本不是目标语言的族、
+    译文却与原文一字不差时才算。日文「学校」译成中文仍是「学校」这类同形词放过。
+
+    定住之后**把译文置空并标 ``failed``**：留着原文的话，导出时它和「本来就该
+    是原文」的条目分不出来（见 :meth:`Cue.render_text`），用户会拿到一份看不出
+    问题的半成品字幕 —— 而这正是回抄这个故障最坏的地方。
+
+    判据放在这里而不是引擎里，是为了让「谁没翻出来」只有一个出口：不管换哪个
+    引擎，这个决定都要过一遍。
+    """
+    stuck = set(
+        locate_untranslated([cue.text for cue in window], results, target_lang)
+    )
+    for position, (cue, text) in enumerate(zip(window, results)):
+        if position in stuck:
+            cue.translation = ""
+            cue.failed = True
+        else:
+            cue.translation = text
+            cue.failed = False
+    return len(stuck)
 
 
 def _apply_partial(window: Sequence[Cue], partial: "Sequence[Tuple[int, str]]") -> int:
@@ -438,6 +467,9 @@ def _apply_partial(window: Sequence[Cue], partial: "Sequence[Tuple[int, str]]") 
         if not isinstance(text, str) or not text.strip():
             continue
         window[index].translation = text
+        # 旧的 failed 标记必须清掉：这条已经重新拿到了译文，留着会让它在导出时
+        # 被写成 [未翻译]，把刚救回来的成果又盖掉。
+        window[index].failed = False
         kept += 1
     return kept
 

@@ -537,7 +537,7 @@ def test_partially_untranslated_batch_is_counted_not_fatal(monkeypatch):
     assert out == ["你好", "世界", "早上好", "OK"]
     assert engine.echo_retry_count == 0, "只有 1/4 没翻，不到整批重发的门槛"
     assert engine.echo_item_count == 1, "应该只挑出 'OK' 这一条去重译"
-    assert engine.echo_item_attempts == 2, "逐条也要试够次数（echo_item_retries=2）"
+    assert engine.echo_item_attempts == 3, "逐条也要试够次数（echo_item_retries=3）"
     assert engine.echo_repaired_count == 0, "重译也没救回来"
     assert engine.untranslated_count == 1, "没救回来的必须计数"
     assert any("1 条疑似未翻译" in n for n in engine.quality_notes())

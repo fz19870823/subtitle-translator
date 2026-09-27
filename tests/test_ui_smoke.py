@@ -819,11 +819,15 @@ def test_retry_reports_what_still_fails_after_another_round(window, qapp, monkey
 
 
 def test_manual_retry_refreshes_the_checkpoint_so_resume_keeps_it(window, qapp, monkeypatch):
-    """中断后手动重试补上的几条，不能在下次续传时被记录里的旧值盖回原文。
+    """手动重试补上的那几条，不能在下次续传时被记录里的旧值盖回原文。
 
-    这是最容易漏掉的一种「静默错误」：断点记录里存的是回抄值（等于原文），
-    续传会拿它无条件覆盖 ``cue.translation`` —— 用户刚花掉的那次重试就白费了，
+    这是最容易漏掉的一种「静默错误」：断点记录里存着上一次的值，续传会拿它
+    无条件覆盖 ``cue.translation`` —— 用户刚花掉的那次重试就白费了，
     而且界面上看不出任何异常。
+
+    顺带守住另一条线：判定「没翻出来」的条目现在会被**置空**（导出显示
+    [未翻译]），因此它压根不该出现在断点记录里 —— ``snapshot`` 只收有译文的条目。
+    这一条同时把「旧回抄值被盖回来」那条路从根上堵死了。
     """
     load_sample(window, LONG_SAMPLE)
     window.engine_combo.setCurrentText("openai")
@@ -835,37 +839,40 @@ def test_manual_retry_refreshes_the_checkpoint_so_resume_keeps_it(window, qapp, 
             time.sleep(0.3)
             return super().translate_batch(requests)
 
-    # 第 1 条（hello）回抄，其余正常 —— 翻过它之后取消
+    # 第 2 条（world）回抄，其余正常 —— 翻过它之后取消
     monkeypatch.setattr(
-        mw, "create_engine_for", lambda name, cfg=None: SlowStubborn({"hello"})
+        mw, "create_engine_for", lambda name, cfg=None: SlowStubborn({"world"})
     )
     window._on_translate()
-    wait_for_progress(window, qapp, 1)
+    wait_for_progress(window, qapp, 2)
     window._on_cancel()
     assert window._worker.wait(15000)
     ckpt = window._worker.checkpoint_path
     wait_idle(window, qapp)
 
-    assert ckpt is not None and ckpt.exists()
-    assert window._stuck_indices == [0]
+    assert ckpt is not None and ckpt.exists(), "第 1 条已经翻好了，断点该建起来"
+    assert window._stuck_indices == [1]
+    assert window._cues[1].translation == "", "翻不出来的那条要置空，不能留原文冒充译文"
+    assert window._cues[1].failed is True
     payload = json.loads(ckpt.read_text(encoding="utf-8"))
-    assert payload["entries"]["0"]["t"] == "hello", "记录里存的就是那条回抄值"
+    assert "0" in payload["entries"], "翻好的第 1 条要记进断点"
+    assert "1" not in payload["entries"], "置空的那条不算「已有译文」，不该进记录"
 
     # 手动重试那一条，这次翻好了
     monkeypatch.setattr(mw, "create_engine_for", lambda name, cfg=None: StubbornEngine())
     window._on_retry_stuck()
     assert window._worker.wait(15000)
     wait_idle(window, qapp)
-    assert window._cues[0].translation == "[zh] hello"
+    assert window._cues[1].translation == "[zh] world"
     assert window._stuck_indices == []
 
     refreshed = json.loads(ckpt.read_text(encoding="utf-8"))
-    assert refreshed["entries"]["0"]["t"] == "[zh] hello", "记录要跟着刷新"
+    assert refreshed["entries"]["1"]["t"] == "[zh] world", "记录要跟着刷新"
 
-    # 接着续传：第 0 条不能被记录里的旧回抄值盖回去
+    # 接着续传：第 2 条不能被记录里的旧值盖回去
     monkeypatch.setattr(window, "_ask_resume", lambda plan: "resume")
     run_translate(window, qapp)
-    assert window._cues[0].translation == "[zh] hello", "续传不该把重试的成果退回原文"
+    assert window._cues[1].translation == "[zh] world", "续传不该把重试的成果退回原文"
 
 
 # ------------------------------------------------------------------ 批量队列
@@ -1271,3 +1278,141 @@ def test_cancelled_settings_dialog_writes_nothing(window, monkeypatch, tmp_path)
     window._on_settings()
 
     assert not target.exists(), "点了取消就不该写文件"
+
+
+# ------------------------------------------------------- 产物落盘与重试未翻译
+
+
+def test_single_file_translation_saves_into_the_output_directory(window, qapp, tmp_path):
+    """单文件翻译也边翻边落盘，成品直接出现在输出目录。
+
+    以前只有队列会自动保存 —— 单文件得用户自己记得点「导出…」，忘了就白翻一遍。
+    而「翻译」这个动作在用户心里本来就该产出文件。
+    """
+    load_sample(window)  # demo.srt：hello / world
+    run_translate(window, qapp)
+
+    out = tmp_path / "output" / "demo.translated.srt"
+    assert out.exists(), "翻完就该在输出目录里出现成品"
+    assert "[zh-CN] hello" in out.read_text(encoding="utf-8")
+    assert "译文文件未能保存" not in window.statusBar().currentMessage()
+
+
+def test_a_failed_line_is_marked_in_the_saved_file(window, qapp, monkeypatch, tmp_path):
+    """翻不出来的那条：成品里写 [未翻译]，而且**不冒充原文**。
+
+    留着原文的话，导出后它和「本来就该是原文」的条目完全分不出来 ——
+    用户会拿到一份看不出来没翻完的字幕，这正是回抄这个故障最坏的地方。
+    """
+    load_sample(window)  # demo.srt：hello / world
+    monkeypatch.setattr(
+        mw, "create_engine_for", lambda name, cfg=None: StubbornEngine({"world"})
+    )
+    window.engine_combo.setCurrentText("openai")
+    monkeypatch.setattr(window, "_ask_retry_stuck", lambda count, retried=False: False)
+    run_translate(window, qapp)
+
+    assert window._stuck_indices == [1]
+    assert window._cues[1].translation == "", "不能留原文冒充译文"
+    content = (tmp_path / "output" / "demo.translated.srt").read_text(encoding="utf-8")
+    assert "[未翻译]" in content, "该翻没翻出来的那条要有显眼标记"
+    assert "[zh] hello" in content, "翻好的那条照常写进去"
+
+
+def test_single_file_retry_keeps_the_lines_already_translated(
+    window, qapp, monkeypatch, tmp_path
+):
+    """点「重试未翻译」不能把成品里**已经翻好**的行退回原文。
+
+    重试只该动那几条没翻出来的，其余原样留着。踩过的坑：重试轮把「只有这几条」
+    的列表交给了落盘，而落盘是**整份重写** —— 成品当场被截断成只剩重试的那几条，
+    已经翻好、用户可能还核对过的行全部退回原文，而且**一个标记都没有**：
+    打开文件看到的是「这份字幕好像大部分没翻」，却不知道出过什么事。
+    """
+    load_sample(window, LONG_SAMPLE)  # hello / world / foo / bar
+    window.engine_combo.setCurrentText("openai")
+    monkeypatch.setattr(
+        mw, "create_engine_for", lambda name, cfg=None: StubbornEngine({"world"})
+    )
+    monkeypatch.setattr(window, "_ask_retry_stuck", lambda count, retried=False: False)
+    run_translate(window, qapp)
+
+    out = tmp_path / "output" / "demo.translated.srt"
+    assert "[未翻译]" in out.read_text(encoding="utf-8"), "第 2 条没翻出来，该有标记"
+
+    # 手动重试那一条（这一轮换成了正常引擎）
+    monkeypatch.setattr(mw, "create_engine_for", lambda name, cfg=None: StubbornEngine())
+    window._on_retry_stuck()
+    assert window._worker.wait(15000)
+    wait_idle(window, qapp)
+
+    content = out.read_text(encoding="utf-8")
+    assert "[zh] world" in content, "重试补上的那条要落进成品"
+    assert "[未翻译]" not in content, "补上了就该把标记去掉"
+    for text in ("hello", "foo", "bar"):
+        assert f"[zh] {text}" in content, f"{text} 早就翻好了，不能被退回原文"
+
+
+def test_global_retry_reruns_only_the_untranslated_items(window, qapp, monkeypatch, tmp_path):
+    """整条队列跑完后，一键把各文件里没翻出来的条目再试一遍。
+
+    三条硬约束：
+    - 只重发没翻出来的那几条 —— 已经翻好的一个字都不能动（用户可能已经核对过）；
+    - 只有出问题的那一份被重跑，其余不打扰（「多个任务时不中断」）；
+    - 重试轮落盘是**整份重写**，所以同一份里早就翻好的行必须原样留在成品里。
+    """
+    window._enqueue(make_queue_files(tmp_path, 2, lines=2))
+    window.engine_combo.setCurrentText("openai")
+
+    created: list[StubbornEngine] = []
+    rounds = {"n": 0}
+
+    def factory(name, app_config=None):
+        rounds["n"] += 1
+        # 第 1 轮两份都用「固执」引擎；重试那一轮换成正常的
+        engine = StubbornEngine({"file1-line1"} if rounds["n"] <= 2 else ())
+        created.append(engine)
+        return engine
+
+    monkeypatch.setattr(mw, "create_engine_for", factory)
+    monkeypatch.setattr(window, "_report_queue", lambda: None)
+
+    # 「重试轮交给落盘的是整份字幕」这条不变量由 worker 的总条数兜住：
+    # 成品是 OutputSink 拿 worker 手里的列表**整份重写**出来的，喂子集就会把
+    # 别的行冲掉。只看最终文件抓不到 —— 队列收尾会拿整份再写一次，把中间那次
+    # 截断盖过去（单文件那条路没有这一下，所以由
+    # test_single_file_retry_keeps_the_lines_already_translated 从文件内容抓）。
+    created_workers: list = []
+
+    class RecordingWorker(mw.TranslateWorker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created_workers.append(self)
+
+    monkeypatch.setattr(mw, "TranslateWorker", RecordingWorker)
+
+    window._on_queue_start()
+    wait_queue_idle(window, qapp)
+
+    stuck = window._queue[0]
+    assert stuck.status == "done"
+    assert stuck.untranslated == 1, "那一条没翻出来要记在账上"
+    assert "[未翻译]" in stuck.output_path.read_text(encoding="utf-8")
+
+    button = window.queue_panel.retry_button
+    assert button.isHidden() is False, "有未翻译条目就该给出重试入口"
+    assert "1" in button.text(), "按钮上要说清有几条"
+
+    window._on_retry_all_stuck()
+    wait_queue_idle(window, qapp)
+
+    assert created[-1].seen == ["file1-line1"], "只重发没翻出来的那一条"
+    assert created_workers[-1].total == len(window._cues), (
+        "重试轮交给落盘的必须是整份字幕；喂子集会把成品截断"
+    )
+    assert len(created) == 3, "第 2 份没出问题，不该被重跑"
+    assert stuck.untranslated == 0
+    content = stuck.output_path.read_text(encoding="utf-8")
+    assert "[未翻译]" not in content, "补上了就该把标记去掉"
+    assert "[zh] file1-line1" in content
+    assert "[zh] file1-line2" in content, "这一行上一轮就翻好了，不能被重试轮冲掉"

@@ -58,6 +58,9 @@ class QueueItem:
     resumed: int = 0
     #: 失败原因（解析失败 / 引擎构造失败 / 翻译失败 / 导出失败）。
     error: str = ""
+    #: 这一轮只重翻「上次没翻出来」的那几条，不是整份重来。
+    #: 由队列收尾后的「重试未翻译」设置（见 :meth:`TranslationQueue.mark_retry_round`）。
+    retry_only: bool = False
 
     @property
     def name(self) -> str:
@@ -228,6 +231,7 @@ class TranslationQueue:
             item.untranslated = 0
             item.resumed = 0
             item.error = ""
+            item.retry_only = False
         self._running = None
 
     def reset_unfinished(self) -> int:
@@ -249,10 +253,29 @@ class TranslationQueue:
             self.reset(index)
         return len(self._items)
 
+    def mark_retry_round(self) -> int:
+        """把「翻完了、但还剩未翻译条目」的项打回待翻译，返回有几项要重试。
+
+        这是队列跑完后的第二手。那些条目在引擎里已经自动重试过三次，按同样的
+        前提再跑一遍不会改善 —— 真正能改变结局的是**换个前提**（换个模型、
+        或把上下文窗口调小），所以单独开一条路：只碰这几份，且每份只重翻
+        ``failed`` 的那几条，已经翻好的一个字不动。
+
+        返回 0 表示没有任何文件还剩未翻译条目，调用方据此拒绝启动空跑。
+        """
+        count = 0
+        for index, item in enumerate(self._items):
+            if item.status == DONE and item.untranslated:
+                self.reset(index)
+                self._items[index].retry_only = True
+                count += 1
+        return count
+
     def summary(self) -> dict:
         """给界面和汇总报告用的计数。"""
         done = failed = pending = 0
         untranslated = resumed = cue_count = 0
+        stuck_files = 0
         for item in self._items:
             if item.status == DONE:
                 done += 1
@@ -261,6 +284,8 @@ class TranslationQueue:
             else:
                 pending += 1
             untranslated += item.untranslated
+            if item.untranslated:
+                stuck_files += 1
             resumed += item.resumed
             cue_count += item.cue_count
         return {
@@ -271,6 +296,8 @@ class TranslationQueue:
             #: 还需要跑的文件数（待翻译 + 失败）——「依次翻译」按钮上的数字
             "unfinished": pending + failed,
             "untranslated": untranslated,
+            #: 还剩未翻译条目的文件数 ——「重试未翻译」按钮据此决定要不要出现
+            "stuck_files": stuck_files,
             "resumed": resumed,
             "cue_count": cue_count,
         }

@@ -5,14 +5,24 @@
 """
 from __future__ import annotations
 
+import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List
+from typing import Callable, Iterable, List, Sequence
 
 
 class SubtitleFormatError(ValueError):
     """字幕文件无法解析。"""
+
+
+#: 「该翻译、但用尽重试仍没翻出来」的条目在导出时的内容。
+#:
+#: 刻意**不写原文**：把原文填回去，「模型没翻」和「本来就不需要翻」就再也分不出来了
+#: —— 用户拿到一份看起来完整的字幕，实际有一半根本没翻译，而且毫无迹象。
+#: 写出一个显眼的标记，是把「没翻」摆到台面上，而不是把它藏起来。
+UNTRANSLATED_MARK = "[未翻译]"
 
 
 _TIMECODE_RE = re.compile(
@@ -32,6 +42,12 @@ class Cue:
     end: float
     text: str
     translation: str = ""
+    #: 这条「该翻译、但重试用尽也没翻出来」。导出时写成 :data:`UNTRANSLATED_MARK`，
+    #: 续传与重试时会被重新送去翻译。
+    #:
+    #: 必须是**显式标记**、不能靠「译文为空」推断：纯符号行（``♪``、``123``）
+    #: 本来就不送模型，译文同样是空的，可两者该导出成完全不同的东西。
+    failed: bool = False
 
     @property
     def duration(self) -> float:
@@ -47,8 +63,20 @@ class Cue:
         return bool(self.translation.strip())
 
     def render_text(self) -> str:
-        """导出时使用的内容：有译文就用译文，否则回落到原文。"""
-        return self.translation.strip() or self.text.strip()
+        """导出时使用的内容。
+
+        三种情况必须分开，不能图省事回落到原文：
+
+        - 有译文 → 用译文；
+        - 该翻译却翻失败了（``failed``）→ 写 :data:`UNTRANSLATED_MARK`。
+          留空等于把这几条从字幕里抹掉，观看时只会觉得「这儿怎么没字幕」；
+        - 其余（纯符号行、数字行、日期之类本来就不需要翻译的）→ 保留原文。
+        """
+        if self.translation.strip():
+            return self.translation.strip()
+        if self.failed:
+            return UNTRANSLATED_MARK
+        return self.text.strip()
 
 
 def parse_timestamp(value: str) -> float:
@@ -193,11 +221,68 @@ def write_file(
     *,
     as_vtt: bool | None = None,
 ) -> Path:
-    """写出字幕。``as_vtt`` 为 None 时按目标文件扩展名决定格式。"""
+    """写出字幕。``as_vtt`` 为 None 时按目标文件扩展名决定格式。
+
+    **原子写**：先落 ``.tmp`` 再 ``os.replace``。翻译就是靠这个函数**边翻边写**的，
+    用户随时可能打开那个文件；直接覆写的话，撞上写了一半的瞬间会看到一个被截断的
+    字幕，而播放器只会闷声不响地少放半集。
+    """
     target = Path(path)
     if as_vtt is None:
         as_vtt = target.suffix.lower() == ".vtt"
     content = to_vtt(cues) if as_vtt else to_srt(cues)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8", newline="\n")
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
     return target
+
+
+@dataclass
+class OutputSink:
+    """在**后台线程**里把当前译文按批写进目标字幕文件。
+
+    为什么与断点文件分开：断点（``data/checkpoints``）解决的是「下次还能接着翻」，
+    它躺在内部目录、格式也不是字幕，用户拿不到手。这里写的是**成品本身** ——
+    翻到哪，打开那个 .srt 就能看到哪；中途关窗、掉电、崩溃，已经翻好的部分都在。
+
+    节流沿用 ``CheckpointWriter`` 的思路：一批 3–5 秒、上千条要几十上百批，每批都
+    写盘纯属浪费（Windows Defender 会跟着扫一遍）。默认两秒一次，真丢了也只是
+    重翻最后两秒的那一批。
+
+    ``error`` 记下最近一次写失败的原因（磁盘满、目录只读）：用户以为译文在正常
+    落盘、实际没有，是最该趁早说出来的一件事。
+    """
+
+    path: Path
+    #: 两次写盘的最小间隔（秒）；0 表示每批都写
+    interval: float = 2.0
+    clock: Callable[[], float] = time.monotonic
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        self.path = Path(self.path)
+        # 0 而不是 clock()：进程刚起来时 clock() 也可能很小，用 0 保证**第一批必写**。
+        # 否则前两秒内崩掉，磁盘上连一个字节都没有。
+        self._last = 0.0
+
+    def maybe(self, cues: Sequence[Cue]) -> bool:
+        """到点了才写。返回本次是否真的落了盘。"""
+        if self.interval > 0 and (self.clock() - self._last) < self.interval:
+            return False
+        return self.flush(cues)
+
+    def flush(self, cues: Sequence[Cue]) -> bool:
+        """立刻写一次（取消、失败、收尾时用，不受节流限制）。"""
+        try:
+            write_file(self.path, cues)
+        except OSError as exc:
+            self.error = str(exc)
+            return False
+        self._last = self.clock()
+        self.error = ""
+        return True
