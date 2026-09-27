@@ -1023,6 +1023,9 @@ class MainWindow(QMainWindow):
     def _finish_queue(self, cancelled: bool = False, note: str = "") -> None:
         """整条队列收尾：写状态栏，有必要时把明细摆出来。"""
         self._queue_mode = False
+        # 队列真的结束了，面板这才解除忙碌 —— 否则「重试未翻译」按钮会被
+        # _set_busy 那一刻的 _queue_mode（那时还挂着「队列在跑」）永久挡住。
+        self.queue_panel.set_busy(False)
         counts = self._queue.summary()
         total, done = counts["total"], counts["done"]
         summary = (
@@ -1158,7 +1161,14 @@ class MainWindow(QMainWindow):
             summary = f"重试完成：{retry_count - remaining}/{retry_count} 条已翻好"
         else:
             summary = f"{engine_name} 翻译完成：{source_lang} → {target_lang}"
-        if remaining:
+        # 队列模式下一份一份地报「仍有 N 条未翻译」＝ 每跑完一个文件就提示一次。
+        # 但未翻译是**整条任务列表**的事：那些条目在引擎里已经自动重试过三次，
+        # 要等整条队列跑完，用户才有空换模型、调小上下文窗口，一次改动对所有文件
+        # 生效。中途喊一路，只会让人以为要一份一份去处理 —— 而且那时队列还在跑，
+        # 「重试未翻译」按钮按设计根本不给点。
+        # 这一份有几条没翻出来在队列列表那一行上写着（`_describe`），不丢信息；
+        # 总数由 `_finish_queue` 在整条队列结束时统一报。
+        if remaining and not self._queue_mode:
             summary += f"　|　仍有 {remaining} 条未翻译（可点「重试未翻译」）"
         if notes:
             summary += "　|　" + "；".join(notes)
@@ -1283,7 +1293,11 @@ class MainWindow(QMainWindow):
             not busy and not self._queue_mode and bool(self._cues)
         )
         self.export_button.setEnabled(not busy and bool(self._cues))
-        self.queue_panel.set_busy(busy)
+        # 面板的「忙碌」按**整条队列**算，不是按单个文件算：队列在两个文件之间会
+        # 短暂退出忙碌（前一个 worker 收尾、下一个还没启动），那一瞬间「重试未翻译」
+        # 按钮就会冒出来又缩回去 —— 显示的是刚跑完那一份的条数，点它又没有反应
+        # （队列还在跑，重试入口按设计要等全部跑完）。队列期间它必须一直是收起的。
+        self.queue_panel.set_busy(busy or self._queue_mode)
         self._sync_retry_button()
 
     def _on_progress(self, done: int, total: int) -> None:

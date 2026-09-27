@@ -1309,8 +1309,17 @@ def test_a_failed_line_is_marked_in_the_saved_file(window, qapp, monkeypatch, tm
         mw, "create_engine_for", lambda name, cfg=None: StubbornEngine({"world"})
     )
     window.engine_combo.setCurrentText("openai")
-    monkeypatch.setattr(window, "_ask_retry_stuck", lambda count, retried=False: False)
+    asked: list = []
+    monkeypatch.setattr(
+        window,
+        "_ask_retry_stuck",
+        lambda count, retried=False: asked.append((count, retried)) or False,
+    )
     run_translate(window, qapp)
+
+    # 单文件没有队列可等 —— 翻完就该当场说，并且当场给一条出路。
+    assert asked == [(1, False)], "单文件翻译要立刻问一句要不要重试"
+    assert "仍有 1 条未翻译" in window.statusBar().currentMessage()
 
     assert window._stuck_indices == [1]
     assert window._cues[1].translation == "", "不能留原文冒充译文"
@@ -1416,3 +1425,74 @@ def test_global_retry_reruns_only_the_untranslated_items(window, qapp, monkeypat
     assert "[未翻译]" not in content, "补上了就该把标记去掉"
     assert "[zh] file1-line1" in content
     assert "[zh] file1-line2" in content, "这一行上一轮就翻好了，不能被重试轮冲掉"
+
+
+def test_untranslated_is_reported_once_when_the_whole_queue_is_done(
+    window, qapp, monkeypatch, tmp_path
+):
+    """多个任务时，「有未翻译」只在**整条队列**跑完后报一次。
+
+    以前是每翻完一份就报一次：状态栏连喊三遍「仍有 1 条未翻译（可点「重试未翻译」）」，
+    而那时「重试未翻译」按钮按设计根本不给点（队列还在跑）。用户看到的是「提示了
+    三次」，随之而来的理解是「要一份一份去处理」—— 恰恰相反：那几个条目在引擎里
+    已经自动重试过三次，该做的是**整条队列跑完之后**换个模型、把上下文窗口调小，
+    一次改动对所有文件生效。
+
+    同一条纪律也管着按钮：队列期间它必须一直收着（含两个文件之间的缝隙 ——
+    那时前一个 worker 已收尾、下一个还没启动，界面会短暂退出「忙碌」）。
+    """
+    window._enqueue(make_queue_files(tmp_path, 3, lines=2))
+    window.engine_combo.setCurrentText("openai")
+    monkeypatch.setattr(
+        mw,
+        "create_engine_for",
+        lambda name, cfg=None: StubbornEngine(
+            {"file1-line1", "file2-line1", "file3-line1"}
+        ),
+    )
+
+    asked: list = []
+    monkeypatch.setattr(
+        window,
+        "_ask_retry_stuck",
+        lambda count, retried=False: asked.append((count, retried)) or False,
+    )
+    reported: list = []
+    monkeypatch.setattr(window, "_report_queue", lambda: reported.append(True))
+
+    messages: list[str] = []
+    window.statusBar().messageChanged.connect(messages.append)
+    #: 「推进下一个文件」的每一刻按钮是收起还是露出（True=收着）
+    hidden_states: list[bool] = []
+    real_next = window._run_next_queue_item
+
+    def spy_next():
+        hidden_states.append(window.queue_panel.retry_button.isHidden())
+        return real_next()
+
+    monkeypatch.setattr(window, "_run_next_queue_item", spy_next)
+
+    window._on_queue_start()
+    wait_queue_idle(window, qapp)
+
+    per_file = [text for text in messages if text.startswith("openai 翻译完成")]
+    assert len(per_file) == 3, "三份都该有各自的完成提示"
+    assert not any("未翻译" in text for text in per_file), (
+        "队列没跑完就不该逐份提示未翻译 —— 那是整条任务列表的事"
+    )
+    assert asked == [], "队列期间一个「有未翻译」的窗都不该弹"
+    assert reported == [True], "整条队列跑完只汇报一次"
+    assert hidden_states == [True] * 4, (
+        "队列期间（含文件之间的缝隙）重试按钮必须一直收起，"
+        "它要等整条队列结束才露面"
+    )
+    # 每份的条数在队列列表那一行上写着，不因为不提示而丢信息
+    assert [item.untranslated for item in window._queue] == [1, 1, 1]
+
+    final = window.statusBar().currentMessage()
+    assert "队列完成：3/3" in final
+    assert "共 3 条未翻译" in final, "总数要在整条队列结束时一次说清"
+    assert window.queue_panel.retry_button.isHidden() is False, (
+        "队列结束了，重试入口这才该出现"
+    )
+    assert "3" in window.queue_panel.retry_button.text()
