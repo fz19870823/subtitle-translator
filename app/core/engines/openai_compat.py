@@ -389,24 +389,32 @@ def _is_event_stream(resp: object) -> bool:
     return "event-stream" in str(headers.get("Content-Type") or "").lower()
 
 
-def iter_sse_deltas(
+def iter_stream_lines(
     resp,
     *,
     stop: Callable[[], bool] | None = None,
     poll: float = _STREAM_POLL,
     stall_timeout: float = 120.0,
 ) -> Iterator[str]:
-    """逐行读 SSE，产出 ``delta.content`` 片段。
+    """逐行读一个流式响应，产出**去掉首尾空白**的整行。
 
-    只认 ``data:`` 行；``:`` 开头的心跳、空行、解析不出来的行一律跳过 ——
-    一行坏数据不该毁掉整批字幕。
+    只负责「把行拿进来、让取消查得到、卡死了要报错」，怎么解释这些行交给调用方。
+    抽出来是因为流式协议不止一种：OpenAI 兼容层用 SSE（``data: {...}``），
+    Ollama 用 NDJSON（一行一个 JSON 对象，没有前缀）。两者的**读取**部分一模一样，
+    而这段恰恰是最难写对的一段（线程、取消时机、连接释放），没必要写两遍、
+    更没必要让两份实现慢慢漂开。
 
     读取跑在后台线程（见 :class:`_StreamReader`），本函数只从队列里取行 ——
-    所以 ``stop()`` 不但在分片之间查得到，在「模型还在想」的那几秒里也查得到。
-    取消延迟是 ``poll``，不是「等第一个分片」。
+    所以 ``stop()`` 不但在数据行之间查得到，在「模型还在想」的那几秒里也查得到。
+    取消延迟是 ``poll``，不是「等第一个字节」。
 
     ``stall_timeout`` 是「多久没有任何数据就算死了」：有它兜底，一个中途不再
     说话的流不会把读取线程永远挂住。
+
+    ⚠️ 取消检查在 ``yield`` **之后**，也就是「调用方处理完这一行、回来要下一行」
+    的时候。顺序不能反：读取线程可能提前把几行塞进了队列，若在交出当前行之前
+    就抛取消，那些已经到手的行会被当成「还没收到」而丢掉 ——
+    而用户点取消时最想留住的恰恰就是它们。
     """
     out: "queue.Queue" = queue.Queue()
     abort = threading.Event()
@@ -433,20 +441,7 @@ def iter_sse_deltas(
                 raise item
             last_data = time.monotonic()
             line = item.decode("utf-8", errors="replace") if isinstance(item, bytes) else item
-            line = line.strip()
-            if line and not line.startswith(":") and line.startswith("data:"):
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    return
-                try:
-                    payload = json.loads(data)
-                except json.JSONDecodeError:
-                    payload = None
-                if payload is not None:
-                    yield from _deltas_from(payload)
-            # 已经到手的这一行先处理掉，然后才查取消。顺序不能反：读取线程可能
-            # 提前把几行塞进了队列，反过来的话那些行会被当成「还没收到」而丢掉 ——
-            # 而用户点取消时最想留住的恰恰就是它们。
+            yield line.strip()
             if stop is not None and stop():
                 raise TranslationCancelled("已取消（流式接收中）")
     finally:
@@ -454,6 +449,42 @@ def iter_sse_deltas(
         # 这一步不会把调用方拖住（见它的注释）。
         abort.set()
         _release_stream(reader, resp)
+
+
+def iter_sse_deltas(
+    resp,
+    *,
+    stop: Callable[[], bool] | None = None,
+    poll: float = _STREAM_POLL,
+    stall_timeout: float = 120.0,
+) -> Iterator[str]:
+    """逐行读 SSE，产出 ``delta.content`` 片段。
+
+    只认 ``data:`` 行；``:`` 开头的心跳、空行、解析不出来的行一律跳过 ——
+    一行坏数据不该毁掉整批字幕。
+
+    读取部分在 :func:`iter_stream_lines` 里（后台线程 + 取消 + 卡死保护）。
+    """
+    lines = iter_stream_lines(
+        resp, stop=stop, poll=poll, stall_timeout=stall_timeout
+    )
+    try:
+        for line in lines:
+            if not line or line.startswith(":") or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                return
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                payload = None
+            if payload is not None:
+                yield from _deltas_from(payload)
+    finally:
+        # 显式收掉内层生成器：让它的 finally（叫停读取线程、释放连接）跑到，
+        # 而不是等 GC 回收 —— 那样时机不可控。
+        lines.close()
 
 
 def _deltas_from(payload: Any) -> List[str]:
@@ -723,6 +754,20 @@ class OpenAICompatTranslator(Translator):
         )
 
     # ------------------------------------------------------------------ 配置工厂
+    @staticmethod
+    def fetch_models(
+        base_url: str = "", api_key: str = "", *, timeout: int = 30
+    ) -> List[str]:
+        """拉取模型 id 列表（``GET {base_url}/models``）。
+
+        界面层按引擎取用这个方法，所以每个引擎都得提供一个同名同签名的静态方法 ——
+        拉列表的地址**随引擎而异**（Ollama 走 ``/api/tags``），写死成某一个引擎的
+        实现会让另一个引擎的「拉取模型」按钮打到不存在的路径上。
+
+        注意这里是调用模块级同名函数，不是递归：类属性不参与函数体内的全局名查找。
+        """
+        return fetch_models(base_url, api_key, timeout=timeout)
+
     @classmethod
     def from_config(
         cls,

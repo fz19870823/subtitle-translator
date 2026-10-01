@@ -21,6 +21,10 @@ _HINT_STYLE = "color: palette(mid);"
 #: ``set_source_provider`` 注入的回调：返回 (base_url, api_key, timeout)
 SourceProvider = Callable[[], Tuple[str, str, int]]
 
+#: ``set_fetcher`` 注入的取数函数。**按引擎而异** —— OpenAI 兼容层在
+#: ``/models``，Ollama 在 ``/api/tags``，不能写死。
+ModelFetcher = Callable[..., List[str]]
+
 
 class ModelFetchWorker(QThread):
     """后台拉取模型列表。"""
@@ -28,15 +32,25 @@ class ModelFetchWorker(QThread):
     fetched = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, base_url: str, api_key: str, timeout: int, parent=None) -> None:
+    def __init__(
+        self,
+        fetcher: ModelFetcher,
+        base_url: str,
+        api_key: str,
+        timeout: int,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
+        self._fetcher = fetcher
         self._base_url = base_url
         self._api_key = api_key
         self._timeout = timeout
 
     def run(self) -> None:  # 在工作线程里执行，不能碰任何界面对象
         try:
-            models = fetch_models(self._base_url, self._api_key, timeout=self._timeout)
+            models = self._fetcher(
+                self._base_url, self._api_key, timeout=self._timeout
+            )
         except Exception as exc:  # 网络层什么异常都可能抛，绝不能让它掀掉线程
             self.failed.emit(str(exc))
             return
@@ -76,8 +90,12 @@ class ModelSelector(QWidget):
         layout.addWidget(self.status, 1)
 
         self._source_provider: SourceProvider | None = None
+        #: None 表示「用模块级的默认实现」，到 ``fetch()`` 那一刻才解析 ——
+        #: 这样测试里替换 ``fetch_models`` 对已经建好的控件同样生效。
+        self._fetcher: ModelFetcher | None = None
         self._worker: ModelFetchWorker | None = None
         self._active = True
+        self._requires_key = True
 
         self.fetch_button.clicked.connect(self.fetch)
 
@@ -86,6 +104,19 @@ class ModelSelector(QWidget):
     def set_source_provider(self, provider: SourceProvider) -> None:
         """注册数据源，回调需返回 ``(base_url, api_key, timeout)``。"""
         self._source_provider = provider
+
+    def set_fetcher(self, fetcher: ModelFetcher | None) -> None:
+        """注册取模型列表的函数：``fetcher(base_url, api_key, *, timeout)``。
+
+        按引擎注入 —— 本地服务（Ollama）的列表在 ``/api/tags``，拿 OpenAI 那套
+        打到 ``/models`` 上会 404，而错误信息只会说「拉取模型列表失败: HTTP 404」，
+        完全指不到「地址填错了还是引擎选错了」。传 None 则回到默认实现。
+        """
+        self._fetcher = fetcher
+
+    def set_requires_key(self, required: bool) -> None:
+        """这个引擎没有密钥这回事（本地推理服务）时，别再拿密钥拦人。"""
+        self._requires_key = bool(required)
 
     def set_active(self, active: bool) -> None:
         """引擎不需要 API 参数（如 echo）时整体禁用。"""
@@ -140,7 +171,7 @@ class ModelSelector(QWidget):
         if not base_url:
             self._warn("请先填写 API 地址")
             return
-        if not api_key:
+        if not api_key and self._requires_key:
             self._warn("请先填写密钥")
             return
 
@@ -148,7 +179,9 @@ class ModelSelector(QWidget):
         self.status.setStyleSheet(_HINT_STYLE)
         self.status.setText("拉取中…")
 
-        worker = ModelFetchWorker(base_url, api_key, int(timeout), self)
+        # 在这里解析默认实现（而不是构造时缓存），测试替换 fetch_models 才有效。
+        fetcher = self._fetcher or fetch_models
+        worker = ModelFetchWorker(fetcher, base_url, api_key, int(timeout), self)
         worker.fetched.connect(self._on_fetched)
         worker.failed.connect(self._on_failed)
         worker.finished.connect(self._on_finished)

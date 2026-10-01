@@ -5,8 +5,12 @@
 PySide6 桌面界面 + 可插拔翻译后端。整条链路（读取 → 翻译 → 边翻边落盘）已打通并有测试覆盖：
 中途关窗、掉电、崩溃都不会让已经翻好的部分白跑；没翻出来的条目会在成品里标成
 `[未翻译]`，跑完可以一键重试（多个文件排队翻时，只在**整条队列**跑完后提示一次）。
-已内置一个 **OpenAI 兼容**翻译后端，可对接任何暴露
-`POST {base_url}/chat/completions` 的服务（OpenAI、各类中转/聚合网关、本地推理服务）。
+已内置两个翻译后端：
+
+- **OpenAI 兼容** —— 对接任何暴露 `POST {base_url}/chat/completions` 的服务
+  （OpenAI、各类中转/聚合网关）；
+- **Ollama** —— 对接本机/局域网里的 Ollama（`POST /api/chat`）。没有密钥这回事，
+  走原生接口而不是它的 OpenAI 兼容层，原因见[本地模型](#本地模型ollama)。
 
 ## 目录结构
 
@@ -18,6 +22,7 @@ subtitle-translator/
 ├── config.local.json               # 本地配置，已被 .gitignore 屏蔽
 ├── scripts/
 │   ├── check_api.py                # 在线自检：API / 模型配置 + 真实翻译冒烟
+│   ├── verify_ollama.py            # 在线自检：真实 Ollama 端到端（含 /v1 对照）
 │   ├── diag_echo.py                # 诊断：量化「原样回抄」的形态与频率
 │   ├── diag_cancel_latency.py      # 诊断：模型「思考」期间取消检查到底有没有在跑
 │   ├── diag_https_stream.py        # 诊断：流式读取失败那一刻的连接内部状态
@@ -40,7 +45,8 @@ subtitle-translator/
 │   │   ├── checkpoint.py           # 翻译断点：中断后接着翻
 │   │   ├── queue.py                # 批量队列的状态机（无 Qt 依赖）
 │   │   └── engines/
-│   │       └── openai_compat.py    # OpenAI 兼容后端
+│   │       ├── openai_compat.py    # OpenAI 兼容后端
+│   │       └── ollama.py           # Ollama 后端（原生 /api/chat）
 │   └── ui/
 │       ├── main_window.py          # 主窗口（含队列的执行编排）
 │       ├── translate_worker.py     # 后台翻译线程（避免界面冻结）
@@ -54,6 +60,7 @@ subtitle-translator/
     ├── test_checkpoint.py          # 断点记录的读写、复用判定与写入节流
     ├── test_queue.py               # 队列状态机：入队、排序、跳过失败、重置
     ├── test_openai_compat.py       # 协议解析、换行处理、模型列表、链路重试（不联网）
+    ├── test_ollama.py              # Ollama 后端：NDJSON、上下文保护、think/keep_alive（不联网）
     ├── test_streaming.py           # 流式接收：SSE 解析、增量切元素、取消抢救、降级路径
     ├── test_untranslated_pipeline.py # 未翻译全链路：置空打标、[未翻译] 占位、增量落盘、重试轮
     ├── test_ui_smoke.py            # 主窗口冒烟（需要 PySide6，否则跳过）
@@ -128,8 +135,8 @@ copy config.example.json config.local.json
 
 | 字段 | 说明 |
 | --- | --- |
-| `engine` | 注册表里的引擎名；`openai` 为 OpenAI 兼容后端，`echo` 为离线占位 |
-| `base_url` | 到 `/v1` 为止，代码会自行拼 `/chat/completions` 与 `/models` |
+| `engine` | 注册表里的引擎名；`openai` 为 OpenAI 兼容后端，`ollama` 为本地推理，`echo` 为离线占位 |
+| `base_url` | `openai`：到 `/v1` 为止，代码拼 `/chat/completions` 与 `/models`；`ollama`：填服务根（如 `192.168.1.50:11434`），代码拼 `/api/chat` 与 `/api/tags`，多填的 `/v1`、`/api` 会自动剥掉 |
 | `model` | 模型 id，必须存在于服务端 `/v1/models` 返回的列表中 |
 | `api_key_file` | 密钥文件路径，运行时读取；**推荐**，避免密钥出现副本 |
 | `api_key` | 直接写明文密钥（优先级低于环境变量、高于 `api_key_file`） |
@@ -148,6 +155,78 @@ copy config.example.json config.local.json
 - `TranslationConfig.resolve_api_key()` 每次现读；
 - `AppConfig.describe()` 只报告密钥来源（`env:` / `file:` / `config:`），从不输出内容；
 - 后端的 `__repr__` 输出 `api_key=<hidden>`，避免异常回溯带出密钥。
+
+## 本地模型（Ollama）
+
+下拉框选 `ollama`，地址填服务根就行 —— 不需要密钥（引擎里 `api_key_required = False`，
+界面不会拿「请先填写密钥」拦人），「拉取模型」走的是 `/api/tags`：
+
+```jsonc
+{
+  "translation": {
+    "engine": "ollama",
+    "base_url": "http://192.168.1.50:11434",   // 多填的 /v1、/api 会自动剥掉
+    "model": "huihui_ai/qwen2.5-abliterate:14b",
+    "batch_size": 20
+  }
+}
+```
+
+自检：`python scripts/verify_ollama.py`（带 `--base-url` 可临时覆盖配置里的地址）。
+
+### 为什么不走它的 OpenAI 兼容层
+
+`/v1/chat/completions` 看起来能用 —— 拉列表、非流式、SSE 流式都返回 200。
+但它**静默丢弃** Ollama 的专有字段。2026-10-01 在 Ollama 0.34.0 上，用
+`GET /api/ps` 里模型**实际加载时**的 `context_length` 当判据（「返回 200」不能当证据，
+丢字段一样返回 200）：
+
+| 送出的字段 | 期望 | `/api/ps` 实测 | 结论 |
+| --- | --- | --- | --- |
+| `/v1` + `options.num_ctx=8192` | 8192 | 40960（与不传时相同） | 丢弃 |
+| 不传 options（对照） | 模型默认 | 40960 | —— |
+| `/v1` + `keep_alive="30m"` | 30 分钟后卸载 | `expires_at` − now = 5 分 02 秒 | 丢弃 |
+| `/v1` + `think=false` | 不产出思维链 | 照样产出 | 丢弃 |
+| **原生** `/api/chat` + `num_ctx=16384` | 16384 | **16384** | 生效 |
+
+可以用 `python scripts/verify_ollama.py --compare-v1` 在这台机器上重跑这张表。
+
+### 三个必须自己控制的参数
+
+- **`think`**（默认 `false`）—— qwen3 这类会「想」的模型默认先写一大段思维链。
+  实测同一份三行字幕：开着 4.93s、关掉 0.58s（8.5 倍），译文看不出差别；
+  而把输出预算卡紧时思维链会把预算吃光，`content` 返回**空串**、
+  `done_reason="length"`（探针实测 `num_predict=256` 时 `content=""`、
+  `thinking` 有 439 字）。空串往下走会被判成「整批没翻出来」→ 逐条重译 → 每条还是空
+  → 最后报一句和原因毫无关系的「译文与原文完全相同」。非思考模型收到
+  `think: false` 不会报错（实测 200 + 正常正文），所以无条件发。
+- **`keep_alive`**（默认 `30m`）—— Ollama 默认 5 分钟就把模型卸载。队列在两个文件
+  之间停一会儿（或用户接个电话），下一个请求就要重新加载：实测冷加载 11.2s、热 0.2s。
+- **`num_ctx`**（默认**不传**）—— 不传时 Ollama 用的是**模型自身的上限**
+  （实测 qwen2.5-14b → 32768、qwen3-8b → 40960），比手填的任何值都合理，
+  所以默认交给它。只有想压住显存时才需要显式指定。
+
+### 上下文：能拦住就拦，拦不住就认出来
+
+Ollama 在提示词超出上下文时**静默截断**。实测往一个 `num_ctx=4096` 的模型里塞约
+11500 个汉字：HTTP 200、没有报错、`done_reason="stop"`，而 `prompt_eval_count`
+只有 2050 —— 提示词被砍掉了八成，砍掉的还是**开头**，也就是 system prompt 里那段
+「只输出 JSON 数组」的要求。后果不是报错，而是一份看起来翻了、协议其实已经崩掉的译文。
+
+所以两道防线：
+
+1. **发之前**按保守估计（汉字 1 字 1 token、其余 2 字符 1 token，宁多勿少）算一遍。
+   显式设了 `num_ctx` 时：放得下就压短生成长度（并记一笔，在状态栏里说出来），
+   连最低预算都放不下就直接报错、一个请求都不发。
+2. **收回来**核对 `prompt_eval_count` 与 token 数的**下界**。判据不是「和估计值比」
+   （我们的估计本来就是上界，比实际高是正常的），而是下界 —— 真实 token 数不可能
+   低于它，低太多只有一个解释：服务端为了塞进上下文把提示词砍了。命中就停下来报清楚。
+
+引擎专属的旋钮放在 `translation.ollama` 子对象里，不污染共用配置：
+
+```jsonc
+"ollama": {"num_ctx": 16384, "keep_alive": "1h", "think": false, "check_truncation": true}
+```
 
 ## 运行
 
@@ -548,6 +627,21 @@ python scripts/verify_output_pipeline.py --items 20 --batch 5 --interval 0
 
 依次做三件事：打印配置摘要（密钥只报来源）、拉 `/v1/models` 并确认配置的模型存在、
 用样例字幕跑通项目自身的翻译代码路径并校验行数/标签/换行。密钥不会出现在输出里。
+（它固定走 OpenAI 兼容后端。）
+
+用本地模型的话有专门的：
+
+```
+.venv\Scripts\python.exe scripts\verify_ollama.py
+.venv\Scripts\python.exe scripts\verify_ollama.py --list            # 只看有哪些模型
+.venv\Scripts\python.exe scripts\verify_ollama.py --model <id> --batch 6
+.venv\Scripts\python.exe scripts\verify_ollama.py --compare-v1      # 对照 /v1 丢字段
+```
+
+它除了跑一遍真实翻译，还会拿 `/api/ps` 核对**服务端实际状态**：
+`keep_alive` 有没有生效（看 `expires_at` 距现在多久）、显式设的 `num_ctx`
+有没有被采纳、这一轮有没有批次被截断。`--compare-v1` 会卸载并重新加载模型，
+不想被打断就别加。
 
 ## 测试
 
@@ -561,8 +655,16 @@ python scripts/verify_output_pipeline.py --items 20 --batch 5 --interval 0
 若引擎需要外部参数，再加一个 `from_config(cfg)` 类方法，界面与 `create_engine_for()`
 会自动走它。
 
-需要 API 地址 / 密钥 / 模型的引擎，把类属性 `requires_api` 设为 `True`，主界面据此启用
-模型选择控件；默认 `False`（`echo` 这类离线引擎就用不到）。
+三个类属性决定界面行为，它们管的是**三件不同的事**，别混成一个：
+
+| 类属性 | 管什么 | 谁不用默认值 |
+| --- | --- | --- |
+| `requires_api` | 要不要填地址和模型（`False` 时模型控件整体禁用） | 默认 `True` 之外的 `echo` 设 `False` |
+| `api_key_required` | 不填密钥算不算配置错误 | 本地服务（Ollama）设 `False` |
+| `fetch_models` | 「拉取模型」打哪个接口 | 每个引擎都该给一个 `@staticmethod`（签名 `(base_url, api_key, *, timeout)`）—— 写死成某一个引擎的路径，另一个引擎的按钮就会打到 404 上 |
+
+前两个混成一个的话，本地服务会被逼着填一串假密钥，而「拉取模型」还会以
+「请先填写密钥」为由拒绝工作。
 
 ```python
 from app.core.translator import TranslationRequest, Translator, register
@@ -681,6 +783,9 @@ class MyLlmTranslator(Translator):
 - [x] 界面内配置 API 地址 / 密钥，模型可拉取列表选择或手输
 - [x] 配置保存（覆盖前备份、临时文件原子替换）
 - [x] OpenAI 兼容后端（批量 JSON 协议、换行保真、逐条回退）
+- [x] Ollama 后端：走原生 `/api/chat`，无密钥，可控 `think` / `keep_alive` / `num_ctx`
+- [x] 本地模型防静默故障：发前拦住放不下的批次，收回来核对 `prompt_eval_count`
+- [x] Ollama 在线自检脚本 `scripts/verify_ollama.py`（含 `/v1` 兼容层丢字段的对照）
 - [x] 整批原样回抄检测：整批重发 → 逐条重译 → 仍不成就报错，不静默交付未翻译内容
 - [x] 重试次数按实测失败率定（请求级回抄 ≈ 1/3，重试 3 次把「全中」压到 1.2%）
 - [x] 源语言为 `auto` 时按文本书写族推断真实语言，让默认用法也在防护范围内

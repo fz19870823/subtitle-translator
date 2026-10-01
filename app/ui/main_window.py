@@ -272,16 +272,24 @@ class MainWindow(QMainWindow):
         self.config_label.setText(self._config_summary())
 
     def _on_engine_changed(self, engine_name: str) -> None:
-        """按引擎能力决定模型控件是否可用（echo 用不到地址和模型）。"""
+        """按引擎能力调整模型控件（echo 用不到地址和模型；本地服务不要密钥）。"""
         engine = ENGINES.get(engine_name)
         self.model_selector.set_active(bool(getattr(engine, "requires_api", False)))
+        self.model_selector.set_requires_key(
+            bool(getattr(engine, "api_key_required", True))
+        )
+        # 「拉取模型」的地址随引擎而异：OpenAI 兼容层在 /models，Ollama 在 /api/tags。
+        self.model_selector.set_fetcher(getattr(engine, "fetch_models", None))
         self._refresh_config_label()
 
     def _on_settings(self) -> None:
         engine_name = self.engine_combo.currentText().strip()
+        engine = ENGINES.get(engine_name)
         dialog = SettingsDialog(
             self._config,
-            requires_api=bool(getattr(ENGINES.get(engine_name), "requires_api", False)),
+            requires_api=bool(getattr(engine, "requires_api", False)),
+            api_key_required=bool(getattr(engine, "api_key_required", True)),
+            fetcher=getattr(engine, "fetch_models", None),
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:

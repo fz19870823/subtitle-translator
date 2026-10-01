@@ -37,18 +37,24 @@ class SettingsDialog(QDialog):
     """
 
     def __init__(
-        self, config: AppConfig, *, requires_api: bool = True, parent=None
+        self,
+        config: AppConfig,
+        *,
+        requires_api: bool = True,
+        api_key_required: bool = True,
+        fetcher=None,
+        parent=None,
     ) -> None:
         super().__init__(parent)
         self._config = config
         self.setWindowTitle("设置")
         self.setMinimumWidth(660)
-        self._build_ui(requires_api)
+        self._build_ui(requires_api, api_key_required, fetcher)
         self._load_from(config)
 
     # ------------------------------------------------------------ 界面搭建
 
-    def _build_ui(self, requires_api: bool) -> None:
+    def _build_ui(self, requires_api: bool, api_key_required: bool, fetcher) -> None:
         self.base_url_edit = QLineEdit()
         self.base_url_edit.setPlaceholderText("https://your-endpoint.example.com/v1")
 
@@ -73,6 +79,10 @@ class SettingsDialog(QDialog):
 
         self.model_selector = ModelSelector()
         self.model_selector.set_source_provider(self._probe_source)
+        # 本地推理服务没有密钥，拉列表用的是另一个接口 —— 两件事都要按当前引擎
+        # 传进来，否则选了 Ollama 会被「请先填写密钥」拦住、或者打到 404 的路径上。
+        self.model_selector.set_requires_key(api_key_required)
+        self.model_selector.set_fetcher(fetcher)
         self.model_selector.set_active(requires_api)
 
         self.batch_spin = QSpinBox()
